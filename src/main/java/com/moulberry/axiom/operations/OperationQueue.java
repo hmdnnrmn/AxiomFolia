@@ -1,5 +1,6 @@
 package com.moulberry.axiom.operations;
 
+import com.moulberry.axiom.VersionHelper;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -10,6 +11,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -19,8 +24,65 @@ public class OperationQueue {
     private final Map<ServerLevel, List<PendingOperation>> newPendingOperations = new HashMap<>();
     private final Lock executionLock = new ReentrantLock();
     private final Map<ServerLevel, List<PendingOperation>> pendingOperations = new HashMap<>();
+    private final Map<ServerLevel, WorldQueue> worldQueues = new ConcurrentHashMap<>();
+
+    private static class WorldQueue {
+        private final ServerLevel level;
+        private final Queue<PendingOperation> queue = new ConcurrentLinkedQueue<>();
+        private final AtomicBoolean running = new AtomicBoolean(false);
+
+        public WorldQueue(ServerLevel level) {
+            this.level = level;
+        }
+
+        public void add(PendingOperation operation) {
+            queue.add(operation);
+            processNext();
+        }
+
+        private void processNext() {
+            if (running.compareAndSet(false, true)) {
+                PendingOperation operation = queue.poll();
+                if (operation == null) {
+                    running.set(false);
+                    return;
+                }
+
+                ServerPlayer executor = operation.executor();
+                Runnable startTask = () -> {
+                    try {
+                        operation.startFolia(level, () -> {
+                            running.set(false);
+                            processNext();
+                        });
+                    } catch (Throwable t) {
+                        if (executor != null && !executor.hasDisconnected()) {
+                            executor.getBukkitEntity().kick(net.kyori.adventure.text.Component.text("An error occurred while processing operation: " + t.getMessage()));
+                        }
+                        running.set(false);
+                        processNext();
+                    }
+                };
+
+                if (executor != null && !executor.hasDisconnected()) {
+                    if (executor.getBukkitEntity().getScheduler().run(
+                            com.moulberry.axiom.AxiomPaper.PLUGIN, task -> startTask.run(), null) == null) {
+                        // Executor retired — skip operation and drain queue
+                        running.set(false);
+                        processNext();
+                    }
+                } else {
+                    // No executor (global op) — run directly
+                    startTask.run();
+                }
+            }
+        }
+    }
 
     public void tick() {
+        if (VersionHelper.isFolia()) {
+            return;
+        }
         if (!MinecraftServer.getServer().isSameThread()) {
             throw new WrongThreadException();
         }
@@ -75,6 +137,10 @@ public class OperationQueue {
     }
 
     public void add(ServerLevel level, PendingOperation operation) {
+        if (VersionHelper.isFolia()) {
+            worldQueues.computeIfAbsent(level, k -> new WorldQueue(level)).add(operation);
+            return;
+        }
         this.queueLock.lock();
         try {
             List<PendingOperation> operations = this.newPendingOperations.computeIfAbsent(level, k -> new ArrayList<>());

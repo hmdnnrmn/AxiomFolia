@@ -25,6 +25,7 @@ import net.minecraft.world.phys.Vec3;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.craftbukkit.CraftWorld;
+import org.bukkit.craftbukkit.entity.CraftEntity;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.Nullable;
 
@@ -33,109 +34,146 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class SpawnEntityPacketListener implements PacketHandler {
+public class SpawnEntityPacketListener implements PacketHandler<List<SpawnEntityPacketListener.SpawnEntry>> {
 
     private final AxiomPaper plugin;
     public SpawnEntityPacketListener(AxiomPaper plugin) {
         this.plugin = plugin;
     }
 
-    private record SpawnEntry(UUID newUuid, double x, double y, double z, float yaw, float pitch,
-                              @Nullable UUID copyFrom, CompoundTag tag) {
+    public record SpawnEntry(UUID newUuid, double x, double y, double z, float yaw, float pitch,
+                             @Nullable UUID copyFrom, CompoundTag tag) {
     }
 
     private static final Rotation[] ROTATION_VALUES = Rotation.values();
 
     @Override
-    public void onReceive(Player player, RegistryFriendlyByteBuf friendlyByteBuf) {
-        if (!this.plugin.canUseAxiom(player, AxiomPermission.ENTITY_SPAWN)) {
-            return;
-        }
+    public boolean handleAsync() {
+        return true;
+    }
 
-        if (!this.plugin.canModifyWorld(player, player.getWorld())) {
-            return;
-        }
+    @Override
+    public boolean precheck(Player player, AxiomPaper plugin, RegistryFriendlyByteBuf friendlyByteBuf) {
+        return plugin.canUseAxiom(player, AxiomPermission.ENTITY_SPAWN) && plugin.canModifyWorld(player, player.getWorld());
+    }
 
-        List<SpawnEntry> entries = friendlyByteBuf.readCollection(this.plugin.limitCollection(ArrayList::new),
+    @Override
+    public List<SpawnEntry> parse(UUID playerUuid, int protocolVersion, RegistryFriendlyByteBuf friendlyByteBuf) {
+        return friendlyByteBuf.readCollection(this.plugin.limitCollection(ArrayList::new),
             buf -> new SpawnEntry(buf.readUUID(), buf.readDouble(), buf.readDouble(),
                 buf.readDouble(), buf.readFloat(), buf.readFloat(),
-                buf.readNullable(buffer -> buffer.readUUID()), UnknownVersionHelper.readTagUnknown(buf, player)));
+                buf.readNullable(buffer -> buffer.readUUID()), UnknownVersionHelper.readTagUnknown(buf, protocolVersion)));
+    }
 
-        ServerLevel serverLevel = ((CraftWorld)player.getWorld()).getHandle();
+    @Override
+    public void apply(Player player, List<SpawnEntry> parsed) {
+        for (SpawnEntry entry : parsed) {
+            java.util.function.Consumer<CompoundTag> spawnTask = (tagToUse) -> {
+                int targetX = BlockPos.containing(entry.x, entry.y, entry.z).getX() >> 4;
+                int targetZ = BlockPos.containing(entry.x, entry.y, entry.z).getZ() >> 4;
 
-        for (SpawnEntry entry : entries) {
-            Vec3 position = new Vec3(entry.x, entry.y, entry.z);
+                org.bukkit.World bukkitWorld = player.getWorld();
+                java.util.function.Consumer<Void> doSpawn = (ignored) -> {
+                    ServerLevel serverLevel = ((CraftWorld)bukkitWorld).getHandle();
+                    Vec3 position = new Vec3(entry.x, entry.y, entry.z);
+                    BlockPos blockPos = BlockPos.containing(position);
+                    if (!Level.isInSpawnableBounds(blockPos)) {
+                        return;
+                    }
 
-            BlockPos blockPos = BlockPos.containing(position);
-            if (!Level.isInSpawnableBounds(blockPos)) {
-                continue;
-            }
+                    if (!Integration.canPlaceBlock(player, new Location(bukkitWorld,
+                            blockPos.getX(), blockPos.getY(), blockPos.getZ()))) {
+                        return;
+                    }
 
-            if (!Integration.canPlaceBlock(player, new Location(player.getWorld(),
-                    blockPos.getX(), blockPos.getY(), blockPos.getZ()))) {
-                continue;
-            }
+                    if (serverLevel.getEntity(entry.newUuid) != null) return;
 
-            if (serverLevel.getEntity(entry.newUuid) != null) continue;
+                    CompoundTag tag = tagToUse == null ? new CompoundTag() : tagToUse;
+                    NbtSanitization.sanitizeEntity(tag);
 
-            CompoundTag tag = entry.tag == null ? new CompoundTag() : entry.tag;
+                    if (!tag.contains("id")) return;
 
-            NbtSanitization.sanitizeEntity(tag);
+                    AtomicBoolean useNewUuid = new AtomicBoolean(true);
+
+                    Entity spawned = EntityType.loadEntityRecursive(tag, serverLevel, EntitySpawnReason.COMMAND, entity -> {
+                        if (!this.plugin.canEntityBeManipulated(entity.getType())) {
+                            return null;
+                        }
+
+                        if (useNewUuid.getAndSet(false)) {
+                            entity.setUUID(entry.newUuid);
+                        } else {
+                            entity.setUUID(UUID.randomUUID());
+                        }
+
+                        if (entity instanceof HangingEntity hangingEntity) {
+                            float changedYaw = entry.yaw - entity.getYRot();
+                            int rotations = Math.round(changedYaw / 90);
+                            hangingEntity.rotate(ROTATION_VALUES[rotations & 3]);
+
+                            if (entity instanceof ItemFrame itemFrame && itemFrame.getDirection().getAxis() == Direction.Axis.Y) {
+                                itemFrame.setRotation(itemFrame.getRotation() - Math.round(changedYaw / 45));
+                            }
+                        }
+
+                        entity.snapTo(position.x, position.y, position.z, entry.yaw, entry.pitch);
+                        entity.setYHeadRot(entity.getYRot());
+
+                        return entity;
+                    });
+
+                    if (spawned != null) {
+                        if (serverLevel.tryAddFreshEntityWithPassengers(spawned)) {
+                            AxiomSpawnEntityEvent spawnEntityEvent = new AxiomSpawnEntityEvent(player, spawned.getBukkitEntity());
+                            Bukkit.getPluginManager().callEvent(spawnEntityEvent);
+                            if (spawnEntityEvent.isCancelled() || spawned.isRemoved()) {
+                                for (Entity passenger : spawned.getIndirectPassengers()) {
+                                    passenger.discard();
+                                }
+                                spawned.discard();
+                            }
+                        }
+                    }
+                };
+
+                if (com.moulberry.axiom.VersionHelper.isFolia()) {
+                    org.bukkit.Bukkit.getRegionScheduler().run(this.plugin, bukkitWorld, targetX, targetZ, task -> doSpawn.accept(null));
+                } else {
+                    doSpawn.accept(null);
+                }
+            };
 
             if (entry.copyFrom != null) {
-                Entity entityCopyFrom = serverLevel.getEntity(entry.copyFrom);
-                if (entityCopyFrom != null) {
+                org.bukkit.entity.Entity sourceBukkitEntity = Bukkit.getEntity(entry.copyFrom);
+                if (sourceBukkitEntity != null && com.moulberry.axiom.VersionHelper.isFolia()) {
+                    sourceBukkitEntity.getScheduler().run(this.plugin, task -> {
+                        org.bukkit.craftbukkit.entity.CraftEntity craftSource = (org.bukkit.craftbukkit.entity.CraftEntity) sourceBukkitEntity;
+                        Entity entityCopyFrom = craftSource.getHandle();
+                        var valueOutput = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, entityCopyFrom.registryAccess());
+                        CompoundTag saved = entityCopyFrom.saveAsPassenger(valueOutput) ? valueOutput.buildResult() : null;
+                        CompoundTag tag = entry.tag == null ? new CompoundTag() : entry.tag.copy();
+                        if (saved != null) {
+                            saved.remove("Dimension");
+                            tag = tag.merge(saved);
+                        }
+                        spawnTask.accept(tag);
+                    }, null);
+                } else if (sourceBukkitEntity != null) {
+                    org.bukkit.craftbukkit.entity.CraftEntity craftSource = (org.bukkit.craftbukkit.entity.CraftEntity) sourceBukkitEntity;
+                    Entity entityCopyFrom = craftSource.getHandle();
                     var valueOutput = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, entityCopyFrom.registryAccess());
                     CompoundTag saved = entityCopyFrom.saveAsPassenger(valueOutput) ? valueOutput.buildResult() : null;
+                    CompoundTag tag = entry.tag == null ? new CompoundTag() : entry.tag.copy();
                     if (saved != null) {
                         saved.remove("Dimension");
                         tag = tag.merge(saved);
                     }
-                }
-            }
-
-            if (!tag.contains("id")) continue;
-
-            AtomicBoolean useNewUuid = new AtomicBoolean(true);
-
-            Entity spawned = EntityType.loadEntityRecursive(tag, serverLevel, EntitySpawnReason.COMMAND, entity -> {
-                if (!this.plugin.canEntityBeManipulated(entity.getType())) {
-                    return null;
-                }
-
-                if (useNewUuid.getAndSet(false)) {
-                    entity.setUUID(entry.newUuid);
+                    spawnTask.accept(tag);
                 } else {
-                    entity.setUUID(UUID.randomUUID());
+                    spawnTask.accept(entry.tag);
                 }
-
-                if (entity instanceof HangingEntity hangingEntity) {
-                    float changedYaw = entry.yaw - entity.getYRot();
-                    int rotations = Math.round(changedYaw / 90);
-                    hangingEntity.rotate(ROTATION_VALUES[rotations & 3]);
-
-                    if (entity instanceof ItemFrame itemFrame && itemFrame.getDirection().getAxis() == Direction.Axis.Y) {
-                        itemFrame.setRotation(itemFrame.getRotation() - Math.round(changedYaw / 45));
-                    }
-                }
-
-                entity.snapTo(position.x, position.y, position.z, entry.yaw, entry.pitch);
-                entity.setYHeadRot(entity.getYRot());
-
-                return entity;
-            });
-
-            if (spawned != null) {
-                if (serverLevel.tryAddFreshEntityWithPassengers(spawned)) {
-                    AxiomSpawnEntityEvent spawnEntityEvent = new AxiomSpawnEntityEvent(player, spawned.getBukkitEntity());
-                    Bukkit.getPluginManager().callEvent(spawnEntityEvent);
-                    if (spawnEntityEvent.isCancelled() || spawned.isRemoved()) {
-                        for (Entity passenger : spawned.getIndirectPassengers()) {
-                            passenger.discard();
-                        }
-                        spawned.discard();
-                    }
-                }
+            } else {
+                spawnTask.accept(entry.tag);
             }
         }
     }

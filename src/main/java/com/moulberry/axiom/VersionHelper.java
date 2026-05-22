@@ -61,6 +61,19 @@ public class VersionHelper {
         }
     }
 
+    private static Boolean isFolia = null;
+    public static boolean isFolia() {
+        if (isFolia == null) {
+            try {
+                Class.forName("io.papermc.paper.threadedregions.scheduler.RegionScheduler");
+                isFolia = true;
+            } catch (ClassNotFoundException e) {
+                isFolia = false;
+            }
+        }
+        return isFolia;
+    }
+
     public static void sendCustomPayload(Player player, String id, byte[] data) {
         sendCustomPayload(((CraftPlayer) player).getHandle(), id, data);
     }
@@ -70,8 +83,24 @@ public class VersionHelper {
     }
 
     public static void sendCustomPayload(ServerPlayer serverPlayer, Identifier id, byte[] data) {
-        var payload = createCustomPayload(id, data);
-        serverPlayer.connection.send(new ClientboundCustomPayloadPacket(payload));
+        sendCustomPayload(serverPlayer, id, data, null);
+    }
+
+    public static void sendCustomPayload(ServerPlayer serverPlayer, Identifier id, byte[] data, Runnable retiredRunnable) {
+        if (isFolia()) {
+            var bukkitPlayer = serverPlayer.getBukkitEntity();
+            bukkitPlayer.getScheduler().run(AxiomPaper.PLUGIN, task -> {
+                var payload = createCustomPayload(id, data);
+                serverPlayer.connection.send(new ClientboundCustomPayloadPacket(payload));
+            }, retiredRunnable);
+        } else {
+            if (serverPlayer.getBukkitEntity().isOnline()) {
+                var payload = createCustomPayload(id, data);
+                serverPlayer.connection.send(new ClientboundCustomPayloadPacket(payload));
+            } else if (retiredRunnable != null) {
+                retiredRunnable.run();
+            }
+        }
     }
 
     public static void sendCustomPayloadToAll(List<ServerPlayer> players, String id, byte[] data) {
@@ -83,10 +112,16 @@ public class VersionHelper {
             return;
         }
 
-        var payload = createCustomPayload(id, data);
-        var packet = new ClientboundCustomPayloadPacket(payload);
-        for (ServerPlayer player : players) {
-            player.connection.send(packet);
+        if (isFolia()) {
+            for (ServerPlayer player : players) {
+                sendCustomPayload(player, id, data);
+            }
+        } else {
+            var payload = createCustomPayload(id, data);
+            var packet = new ClientboundCustomPayloadPacket(payload);
+            for (ServerPlayer player : players) {
+                player.connection.send(packet);
+            }
         }
     }
 

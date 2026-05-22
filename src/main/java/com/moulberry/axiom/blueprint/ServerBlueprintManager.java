@@ -31,18 +31,10 @@ public class ServerBlueprintManager {
     private static final Identifier PACKET_BLUEPRINT_MANIFEST_IDENTIFIER = VersionHelper.createIdentifier("axiom:blueprint_manifest");
 
     public static void sendManifest(List<ServerPlayer> serverPlayers) {
-        if (registry != null) {
-            List<ServerPlayer> sendTo = new ArrayList<>();
+        synchronized (ServerBlueprintManager.class) {
+            if (registry == null) return;
 
-            for (ServerPlayer serverPlayer : serverPlayers) {
-                CraftPlayer craftPlayer = serverPlayer.getBukkitEntity();
-                if (AxiomPaper.PLUGIN.canUseAxiom(craftPlayer, AxiomPermission.BLUEPRINT_MANIFEST)) {
-                    sendTo.add(serverPlayer);
-                }
-            }
-
-            if (sendTo.isEmpty()) return;
-
+            List<byte[]> payloads = new ArrayList<>();
             FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
             buf.writeBoolean(true); // replace
 
@@ -51,23 +43,35 @@ public class ServerBlueprintManager {
                 RawBlueprint.writeHeader(buf, entry.getValue());
 
                 if (buf.writerIndex() > MAX_SIZE) {
-                    // Finish and send current packet
                     buf.writeUtf("");
-                    byte[] bytes = ByteBufUtil.getBytes(buf);
-                    for (ServerPlayer serverPlayer : sendTo) {
-                        VersionHelper.sendCustomPayload(serverPlayer, PACKET_BLUEPRINT_MANIFEST_IDENTIFIER, bytes);
-                    }
-
-                    // Continue
+                    payloads.add(ByteBufUtil.getBytes(buf));
                     buf.clear();
                     buf.writeBoolean(false); // don't replace
                 }
             }
 
             buf.writeUtf("");
-            byte[] bytes = ByteBufUtil.getBytes(buf);
-            for (ServerPlayer serverPlayer : sendTo) {
-                VersionHelper.sendCustomPayload(serverPlayer, PACKET_BLUEPRINT_MANIFEST_IDENTIFIER, bytes);
+            payloads.add(ByteBufUtil.getBytes(buf));
+
+            for (ServerPlayer serverPlayer : serverPlayers) {
+                org.bukkit.entity.Player bukkitPlayer = serverPlayer.getBukkitEntity();
+                if (VersionHelper.isFolia()) {
+                    bukkitPlayer.getScheduler().run(AxiomPaper.PLUGIN, task -> {
+                        if (bukkitPlayer.isOnline() && AxiomPaper.PLUGIN.canUseAxiom(bukkitPlayer, AxiomPermission.BLUEPRINT_MANIFEST)) {
+                            for (byte[] payload : payloads) {
+                                var customPayload = VersionHelper.createCustomPayload(PACKET_BLUEPRINT_MANIFEST_IDENTIFIER, payload);
+                                serverPlayer.connection.send(new net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket(customPayload));
+                            }
+                        }
+                    }, null);
+                } else {
+                    if (bukkitPlayer.isOnline() && AxiomPaper.PLUGIN.canUseAxiom(bukkitPlayer, AxiomPermission.BLUEPRINT_MANIFEST)) {
+                        for (byte[] payload : payloads) {
+                            var customPayload = VersionHelper.createCustomPayload(PACKET_BLUEPRINT_MANIFEST_IDENTIFIER, payload);
+                            serverPlayer.connection.send(new net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket(customPayload));
+                        }
+                    }
+                }
             }
         }
     }

@@ -1,16 +1,31 @@
 package com.moulberry.axiom.packet;
 
-import net.minecraft.network.FriendlyByteBuf;
+import com.moulberry.axiom.AxiomPaper;
 import net.minecraft.network.RegistryFriendlyByteBuf;
-import net.minecraft.server.level.ServerPlayer;
 import org.bukkit.entity.Player;
 
-public interface PacketHandler {
+import java.util.UUID;
+
+public interface PacketHandler<T> {
 
     default boolean handleAsync() {
         return false;
     }
 
-    void onReceive(Player player, RegistryFriendlyByteBuf friendlyByteBuf);
+    default boolean precheck(Player player, AxiomPaper plugin, RegistryFriendlyByteBuf friendlyByteBuf) {
+        return true;
+    }
+
+    T parse(UUID playerUuid, int protocolVersion, RegistryFriendlyByteBuf friendlyByteBuf);
+
+    void apply(Player player, T parsed);
+
+    default void onReceive(Player player, RegistryFriendlyByteBuf friendlyByteBuf) {
+        if (!precheck(player, AxiomPaper.PLUGIN, friendlyByteBuf)) {
+            return;
+        }
+        T parsed = parse(player.getUniqueId(), AxiomPaper.PLUGIN.getProtocolVersionFor(player.getUniqueId()), friendlyByteBuf);
+        apply(player, parsed);
+    }
 
 }

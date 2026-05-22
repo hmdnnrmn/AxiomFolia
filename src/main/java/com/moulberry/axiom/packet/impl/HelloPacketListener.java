@@ -30,8 +30,9 @@ import org.bukkit.craftbukkit.entity.CraftPlayer;
 import org.bukkit.entity.Player;
 
 import java.util.List;
+import java.util.UUID;
 
-public class HelloPacketListener implements PacketHandler {
+public class HelloPacketListener implements PacketHandler<HelloPacketListener.Parsed> {
 
     private final AxiomPaper plugin;
 
@@ -39,19 +40,33 @@ public class HelloPacketListener implements PacketHandler {
         this.plugin = plugin;
     }
 
+    public record Parsed(int apiVersion, int dataVersion, int protocolVersion) {}
+
     @Override
-    public void onReceive(Player player, RegistryFriendlyByteBuf friendlyByteBuf) {
+    public boolean precheck(Player player, AxiomPaper plugin, RegistryFriendlyByteBuf friendlyByteBuf) {
         if (!this.plugin.hasPermission(player, AxiomPermission.USE)) {
             this.plugin.failedPermissionAxiomPlayers.add(player.getUniqueId());
-            return;
+            return false;
         }
+        return true;
+    }
 
+    @Override
+    public Parsed parse(UUID playerUuid, int protocolVersion, RegistryFriendlyByteBuf friendlyByteBuf) {
         int apiVersion = friendlyByteBuf.readVarInt();
+        int dataVersion = friendlyByteBuf.readVarInt();
+        int readProtocolVersion = friendlyByteBuf.readVarInt();
+        return new Parsed(apiVersion, dataVersion, readProtocolVersion);
+    }
 
-        if (apiVersion != AxiomConstants.API_VERSION) {
-            String versions = " (C="+apiVersion+" S="+AxiomConstants.API_VERSION+")";
+    @Override
+    public void apply(Player player, Parsed parsed) {
+        if (parsed == null) return;
+
+        if (parsed.apiVersion() != AxiomConstants.API_VERSION) {
+            String versions = " (C="+parsed.apiVersion()+" S="+AxiomConstants.API_VERSION+")";
             Component text;
-            if (apiVersion < AxiomConstants.API_VERSION) {
+            if (parsed.apiVersion() < AxiomConstants.API_VERSION) {
                 text = Component.text("Unable to use Axiom, you're on an outdated version! Please update to the latest version of Axiom to use it on this server." + versions);
             } else {
                 text = Component.text("Unable to use Axiom, server hasn't updated Axiom yet." + versions);
@@ -68,15 +83,12 @@ public class HelloPacketListener implements PacketHandler {
             }
         }
 
-        int dataVersion = friendlyByteBuf.readVarInt();
-        int protocolVersion = friendlyByteBuf.readVarInt();
-
         int serverDataVersion = DFUHelper.DATA_VERSION;
-        if (protocolVersion != SharedConstants.getProtocolVersion()) {
+        if (parsed.protocolVersion() != SharedConstants.getProtocolVersion()) {
             String incompatibleDataVersion = plugin.configuration.getString("incompatible-data-version");
             if (incompatibleDataVersion == null) incompatibleDataVersion = "warn";
 
-            Component incompatibleWarning = Component.text("Axiom: Incompatible data version detected (client " + dataVersion +
+            Component incompatibleWarning = Component.text("Axiom: Incompatible data version detected (client " + parsed.dataVersion() +
                 ", server " + serverDataVersion  + ")");
 
             if (!Bukkit.getPluginManager().isPluginEnabled("ViaVersion")) {
@@ -90,9 +102,9 @@ public class HelloPacketListener implements PacketHandler {
             } else {
                 IdMapper<BlockState> mapper;
                 try {
-                    mapper = ViaVersionHelper.getBlockRegistryForVersion(this.plugin.allowedBlockRegistry, protocolVersion);
+                    mapper = ViaVersionHelper.getBlockRegistryForVersion(this.plugin.allowedBlockRegistry, parsed.protocolVersion());
                 } catch (Exception e) {
-                    String clientDescription = "client: " + ProtocolVersion.getProtocol(protocolVersion);
+                    String clientDescription = "client: " + ProtocolVersion.getProtocol(parsed.protocolVersion());
                     String serverDescription = "server: " + ProtocolVersion.getProtocol(SharedConstants.getProtocolVersion());
                     String description = clientDescription + " <-> " + serverDescription;
                     Component text = Component.text("Axiom+ViaVersion: " + e.getMessage() + " (" + description + ")");
@@ -106,7 +118,7 @@ public class HelloPacketListener implements PacketHandler {
                 }
 
                 this.plugin.playerBlockRegistry.put(player.getUniqueId(), mapper);
-                this.plugin.playerProtocolVersion.put(player.getUniqueId(), protocolVersion);
+                this.plugin.playerProtocolVersion.put(player.getUniqueId(), parsed.protocolVersion());
 
                 Component text = Component.text("Axiom: Warning, client and server versions don't match. " +
                         "Axiom will try to use ViaVersion conversions, but this process may cause problems");
@@ -184,3 +196,4 @@ public class HelloPacketListener implements PacketHandler {
     }
 
 }
+

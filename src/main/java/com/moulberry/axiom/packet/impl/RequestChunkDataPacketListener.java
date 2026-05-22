@@ -4,26 +4,18 @@ import com.moulberry.axiom.AxiomConstants;
 import com.moulberry.axiom.AxiomPaper;
 import com.moulberry.axiom.VersionHelper;
 import com.moulberry.axiom.buffer.CompressedBlockEntity;
-import com.moulberry.axiom.integration.plotsquared.PlotSquaredIntegration;
 import com.moulberry.axiom.operations.RequestChunksOperation;
 import com.moulberry.axiom.packet.PacketHandler;
 import com.moulberry.axiom.restrictions.AxiomPermission;
-import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
-import it.unimi.dsi.fastutil.ints.IntIterator;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.longs.*;
-import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
-import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
-import net.kyori.adventure.text.Component;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.Registries;
-import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.RegistryFriendlyByteBuf;
-import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
@@ -31,80 +23,116 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
-import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.chunk.status.ChunkStatus;
-import net.minecraft.world.level.chunk.LevelChunk;
-import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.PalettedContainer;
-import org.bukkit.Chunk;
-import org.bukkit.World;
-import org.bukkit.craftbukkit.CraftChunk;
 import org.bukkit.craftbukkit.entity.CraftPlayer;
 import org.bukkit.entity.Player;
-import org.bukkit.plugin.messaging.PluginMessageListener;
-import org.jetbrains.annotations.NotNull;
 
 import java.io.ByteArrayOutputStream;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.CompletableFuture;
+import java.util.UUID;
 
-public class RequestChunkDataPacketListener implements PacketHandler {
+public class RequestChunkDataPacketListener implements PacketHandler<RequestChunkDataPacketListener.ParsedPayload> {
 
     private static final Identifier RESPONSE_ID = VersionHelper.createIdentifier("axiom:response_chunk_data");
 
     private final AxiomPaper plugin;
+    private final Map<net.minecraft.network.RegistryFriendlyByteBuf, SessionInfo> sessionInfoMap = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+    public record SessionInfo(boolean shouldSendBlockEntities, int maxChunkLoadDistance) {}
+
+    public record ParsedPayload(
+        long id,
+        ResourceKey<Level> worldKey,
+        boolean sendBlockEntitiesInChunks,
+        LongList blockEntities,
+        LongList chunkSections,
+        boolean shouldSendBlockEntities,
+        int maxChunkLoadDistance
+    ) {}
+
     public RequestChunkDataPacketListener(AxiomPaper plugin) {
         this.plugin = plugin;
     }
 
     @Override
-    public void onReceive(Player bukkitPlayer, RegistryFriendlyByteBuf friendlyByteBuf) {
-        ServerPlayer player = ((CraftPlayer)bukkitPlayer).getHandle();
+    public boolean handleAsync() {
+        return true;
+    }
+
+    @Override
+    public boolean precheck(Player bukkitPlayer, AxiomPaper plugin, RegistryFriendlyByteBuf friendlyByteBuf) {
+        if (friendlyByteBuf.readableBytes() < 8) {
+            return false;
+        }
+        int readerIndex = friendlyByteBuf.readerIndex();
         long id = friendlyByteBuf.readLong();
+        friendlyByteBuf.readerIndex(readerIndex); // Reset reader index
 
-        if (!this.plugin.canUseAxiom(bukkitPlayer, AxiomPermission.CHUNK_REQUEST) || this.plugin.isMismatchedDataVersion(bukkitPlayer.getUniqueId())) {
-            // We always send an 'empty' response in order to make the client happy
+        if (!plugin.canUseAxiom(bukkitPlayer, AxiomPermission.CHUNK_REQUEST) || plugin.isMismatchedDataVersion(bukkitPlayer.getUniqueId())) {
+            ServerPlayer player = ((CraftPlayer)bukkitPlayer).getHandle();
             sendEmptyResponse(player, id);
-            friendlyByteBuf.readerIndex(friendlyByteBuf.writerIndex());
-            return;
+            return false;
         }
 
-        if (!this.plugin.canModifyWorld(bukkitPlayer, bukkitPlayer.getWorld())) {
+        if (!plugin.canModifyWorld(bukkitPlayer, bukkitPlayer.getWorld())) {
+            ServerPlayer player = ((CraftPlayer)bukkitPlayer).getHandle();
             sendEmptyResponse(player, id);
-            friendlyByteBuf.readerIndex(friendlyByteBuf.writerIndex());
-            return;
+            return false;
         }
+
+        boolean shouldSendBlockEntities = plugin.hasPermission(bukkitPlayer, AxiomPermission.CHUNK_REQUESTBLOCKENTITY);
+        int maxChunkLoadDistance = plugin.getMaxChunkLoadDistance(bukkitPlayer.getWorld());
+
+        sessionInfoMap.put(friendlyByteBuf, new SessionInfo(shouldSendBlockEntities, maxChunkLoadDistance));
+        return true;
+    }
+
+    @Override
+    public ParsedPayload parse(UUID playerUuid, int protocolVersion, RegistryFriendlyByteBuf friendlyByteBuf) {
+        SessionInfo info = sessionInfoMap.remove(friendlyByteBuf);
+        boolean shouldSendBlockEntities = info != null ? info.shouldSendBlockEntities : false;
+        int maxChunkLoadDistance = info != null ? info.maxChunkLoadDistance : 0;
+
+        long id = friendlyByteBuf.readLong();
+        ResourceKey<Level> worldKey = friendlyByteBuf.readResourceKey(Registries.DIMENSION);
+        boolean sendBlockEntitiesInChunks = friendlyByteBuf.readBoolean() && shouldSendBlockEntities;
+
+        LongList blockEntities = new LongArrayList();
+        int blockEntityCount = friendlyByteBuf.readVarInt();
+        if (!shouldSendBlockEntities) {
+            friendlyByteBuf.skipBytes(Long.BYTES * blockEntityCount);
+        } else {
+            for (int i = 0; i < blockEntityCount; i++) {
+                blockEntities.add(friendlyByteBuf.readLong());
+            }
+        }
+
+        LongList chunkSections = new LongArrayList();
+        int chunkCount = friendlyByteBuf.readVarInt();
+        for (int i = 0; i < chunkCount; i++) {
+            chunkSections.add(friendlyByteBuf.readLong());
+        }
+
+        return new ParsedPayload(id, worldKey, sendBlockEntitiesInChunks, blockEntities, chunkSections, shouldSendBlockEntities, maxChunkLoadDistance);
+    }
+
+    @Override
+    public void apply(Player bukkitPlayer, ParsedPayload parsed) {
+        ServerPlayer player = ((CraftPlayer)bukkitPlayer).getHandle();
 
         MinecraftServer server = player.level().getServer();
         if (server == null) {
-            sendEmptyResponse(player, id);
-            friendlyByteBuf.readerIndex(friendlyByteBuf.writerIndex());
+            sendEmptyResponse(player, parsed.id);
             return;
         }
 
-        ResourceKey<Level> worldKey = friendlyByteBuf.readResourceKey(Registries.DIMENSION);
-        ServerLevel level = server.getLevel(worldKey);
+        ServerLevel level = server.getLevel(parsed.worldKey);
         if (level == null || level != player.level()) {
-            sendEmptyResponse(player, id);
-            friendlyByteBuf.readerIndex(friendlyByteBuf.writerIndex());
+            sendEmptyResponse(player, parsed.id);
             return;
         }
 
-        boolean shouldSendBlockEntities = this.plugin.hasPermission(bukkitPlayer, AxiomPermission.CHUNK_REQUESTBLOCKENTITY);
-        boolean sendBlockEntitiesInChunks = friendlyByteBuf.readBoolean() && shouldSendBlockEntities;
-
-        int maxChunkLoadDistance = this.plugin.getMaxChunkLoadDistance(level.getWorld());
-
-        if (!shouldSendBlockEntities && maxChunkLoadDistance <= 0) {
-            sendEmptyResponse(player, id);
-            friendlyByteBuf.readerIndex(friendlyByteBuf.writerIndex());
-            return;
-        }
 
         BlockPos.MutableBlockPos mutableBlockPos = new BlockPos.MutableBlockPos();
 
@@ -117,125 +145,66 @@ public class RequestChunkDataPacketListener implements PacketHandler {
         Long2ObjectOpenHashMap<CompressedBlockEntity> sendingBlockEntities = new Long2ObjectOpenHashMap<>();
 
         LongSet chunkFutures = new LongOpenHashSet();
+        LongSet loadedOnlyChunks = new LongOpenHashSet();
         Long2ObjectMap<LongList> sendBlockEntityForPendingChunks = new Long2ObjectOpenHashMap<>();
         Long2ObjectMap<IntList> sendSectionsForPendingChunks = new Long2ObjectOpenHashMap<>();
 
-        int blockEntityCount = friendlyByteBuf.readVarInt();
-        if (!shouldSendBlockEntities) {
-            friendlyByteBuf.skipBytes(Long.BYTES * blockEntityCount);
-        } else {
-            for (int i = 0; i < blockEntityCount; i++) {
+        for (long pos : parsed.blockEntities) {
+            mutableBlockPos.set(pos);
 
-                long pos = friendlyByteBuf.readLong();
-                mutableBlockPos.set(pos);
-
-                if (level.isOutsideBuildHeight(mutableBlockPos)) {
-                    continue;
-                }
-
-                int chunkX = mutableBlockPos.getX() >> 4;
-                int chunkZ = mutableBlockPos.getZ() >> 4;
-
-                int distance = Math.abs(playerSectionX - chunkX) + Math.abs(playerSectionZ - chunkZ);
-                boolean canLoad = distance < maxChunkLoadDistance;
-
-                if (!canLoad) {
-                    LevelChunk chunk = level.getChunkIfLoaded(chunkX, chunkZ);
-                    if (chunk == null) continue;
-
-                    BlockEntity blockEntity = chunk.getBlockEntity(mutableBlockPos, LevelChunk.EntityCreationType.CHECK);
-                    if (blockEntity != null) {
-                        CompoundTag tag = blockEntity.saveWithoutMetadata(player.registryAccess());
-                        sendingBlockEntities.put(pos, CompressedBlockEntity.compress(tag, baos));
-                    }
-                } else {
-                    long chunkPosLong = ChunkPos.pack(chunkX, chunkZ);
-                    LongList blockEntitiesInChunk = sendBlockEntityForPendingChunks.get(chunkPosLong);
-                    if (blockEntitiesInChunk != null) {
-                        blockEntitiesInChunk.add(pos);
-                    } else {
-                        chunkFutures.add(ChunkPos.pack(chunkX, chunkZ));
-
-                        blockEntitiesInChunk = new LongArrayList();
-                        blockEntitiesInChunk.add(pos);
-                        sendBlockEntityForPendingChunks.put(chunkPosLong, blockEntitiesInChunk);
-                    }
-                }
+            if (level.isOutsideBuildHeight(mutableBlockPos)) {
+                continue;
             }
+
+            int chunkX = mutableBlockPos.getX() >> 4;
+            int chunkZ = mutableBlockPos.getZ() >> 4;
+
+            int distance = Math.abs(playerSectionX - chunkX) + Math.abs(playerSectionZ - chunkZ);
+            boolean canLoad = distance < parsed.maxChunkLoadDistance;
+
+            long chunkPosLong = ChunkPos.pack(chunkX, chunkZ);
+            if (!canLoad) {
+                loadedOnlyChunks.add(chunkPosLong);
+            } else {
+                chunkFutures.add(chunkPosLong);
+            }
+
+            LongList blockEntitiesInChunk = sendBlockEntityForPendingChunks.get(chunkPosLong);
+            if (blockEntitiesInChunk == null) {
+                blockEntitiesInChunk = new LongArrayList();
+                sendBlockEntityForPendingChunks.put(chunkPosLong, blockEntitiesInChunk);
+            }
+            blockEntitiesInChunk.add(pos);
         }
 
-        int chunkCount = friendlyByteBuf.readVarInt();
-        if (maxChunkLoadDistance <= 0) {
-            friendlyByteBuf.skipBytes(Long.BYTES * chunkCount);
-        } else {
-            for (int i = 0; i < chunkCount; i++) {
-                long pos = friendlyByteBuf.readLong();
+        for (long pos : parsed.chunkSections) {
+            int sx = BlockPos.getX(pos);
+            int sy = BlockPos.getY(pos);
+            int sz = BlockPos.getZ(pos);
 
-                int sx = BlockPos.getX(pos);
-                int sy = BlockPos.getY(pos);
-                int sz = BlockPos.getZ(pos);
+            int distance = Math.abs(playerSectionX - sx) + Math.abs(playerSectionZ - sz);
+            boolean canLoad = distance < parsed.maxChunkLoadDistance;
 
-                int distance = Math.abs(playerSectionX - sx) + Math.abs(playerSectionZ - sz);
-                boolean canLoad = distance < maxChunkLoadDistance;
-
-                if (!canLoad) {
-                    LevelChunk chunk = level.getChunkIfLoaded(sx, sz);
-                    if (chunk == null) continue;
-
-                    int sectionIndex = chunk.getSectionIndexFromSectionY(sy);
-                    if (sectionIndex < 0 || sectionIndex >= chunk.getSectionsCount()) continue;
-                    LevelChunkSection section = chunk.getSection(sectionIndex);
-
-                    if (section.hasOnlyAir()) {
-                        sendingSections.put(pos, null);
-                    } else {
-                        PalettedContainer<BlockState> container = section.getStates();
-                        sendingSections.put(pos, container);
-
-                        if (sendBlockEntitiesInChunks) {
-                            Set<Map.Entry<BlockPos, BlockEntity>> entrySet = chunk.blockEntities.entrySet();
-                            Iterator<Map.Entry<BlockPos, BlockEntity>> iterator;
-                            if (entrySet instanceof Object2ObjectMap.FastEntrySet fastEntrySet) {
-                                iterator = fastEntrySet.fastIterator();
-                            } else {
-                                iterator = entrySet.iterator();
-                            }
-
-                            while (iterator.hasNext()) {
-                                Map.Entry<BlockPos, BlockEntity> entry = iterator.next();
-
-                                BlockPos blockPos = entry.getKey();
-                                int sectionY = blockPos.getY() >> 4;
-                                if (sectionY != sy) {
-                                    continue;
-                                }
-
-                                CompoundTag tag = entry.getValue().saveWithoutMetadata(player.registryAccess());
-                                sendingBlockEntities.put(blockPos.asLong(), CompressedBlockEntity.compress(tag, baos));
-                            }
-                        }
-                    }
-                } else {
-                    long chunkPosLong = ChunkPos.pack(sx, sz);
-                    IntList sendSections = sendSectionsForPendingChunks.get(chunkPosLong);
-                    if (sendSections != null) {
-                        sendSections.add(sy);
-                    } else {
-                        chunkFutures.add(ChunkPos.pack(sx, sz));
-
-                        sendSections = new IntArrayList();
-                        sendSections.add(sy);
-                        sendSectionsForPendingChunks.put(chunkPosLong, sendSections);
-                    }
-                }
+            long chunkPosLong = ChunkPos.pack(sx, sz);
+            if (!canLoad) {
+                loadedOnlyChunks.add(chunkPosLong);
+            } else {
+                chunkFutures.add(chunkPosLong);
             }
+
+            IntList sendSections = sendSectionsForPendingChunks.get(chunkPosLong);
+            if (sendSections == null) {
+                sendSections = new IntArrayList();
+                sendSectionsForPendingChunks.put(chunkPosLong, sendSections);
+            }
+            sendSections.add(sy);
         }
 
-        if (chunkFutures.isEmpty()) {
-            sendResponse(player, id, sendingBlockEntities, sendingSections);
+        if (chunkFutures.isEmpty() && loadedOnlyChunks.isEmpty()) {
+            sendResponse(player, parsed.id, sendingBlockEntities, sendingSections);
         } else {
-            this.plugin.addPendingOperation(level, new RequestChunksOperation(player, id, chunkFutures, sendBlockEntityForPendingChunks, sendSectionsForPendingChunks,
-                sendBlockEntitiesInChunks, sendingSections, sendingBlockEntities, baos));
+            this.plugin.addPendingOperation(level, new RequestChunksOperation(level, player, parsed.id, chunkFutures, loadedOnlyChunks, sendBlockEntityForPendingChunks, sendSectionsForPendingChunks,
+                parsed.sendBlockEntitiesInChunks, sendingSections, sendingBlockEntities, baos));
         }
     }
 
@@ -359,7 +328,7 @@ public class RequestChunkDataPacketListener implements PacketHandler {
         VersionHelper.sendCustomPayload(player, RESPONSE_ID, bytes);
     }
 
-    private void sendEmptyResponse(ServerPlayer player, long id) {
+    private static void sendEmptyResponse(ServerPlayer player, long id) {
         FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer(16));
         buf.writeLong(id);
         buf.writeLong(AxiomConstants.MIN_POSITION_LONG); // no block entities

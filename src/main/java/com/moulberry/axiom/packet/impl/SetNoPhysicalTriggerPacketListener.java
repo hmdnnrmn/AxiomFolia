@@ -6,7 +6,9 @@ import com.moulberry.axiom.restrictions.AxiomPermission;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import org.bukkit.entity.Player;
 
-public class SetNoPhysicalTriggerPacketListener implements PacketHandler {
+import java.util.UUID;
+
+public class SetNoPhysicalTriggerPacketListener implements PacketHandler<Boolean> {
 
     private final AxiomPaper plugin;
     public SetNoPhysicalTriggerPacketListener(AxiomPaper plugin) {
@@ -14,12 +16,19 @@ public class SetNoPhysicalTriggerPacketListener implements PacketHandler {
     }
 
     @Override
-    public void onReceive(Player player, RegistryFriendlyByteBuf friendlyByteBuf) {
-        if (!this.plugin.canUseAxiom(player, AxiomPermission.PLAYER_SETNOPHYSICALTRIGGER)) {
-            return;
-        }
+    public boolean precheck(Player player, AxiomPaper plugin, RegistryFriendlyByteBuf friendlyByteBuf) {
+        return this.plugin.canUseAxiom(player, AxiomPermission.PLAYER_SETNOPHYSICALTRIGGER);
+    }
 
-        this.plugin.setNoPhysicalTrigger(player.getUniqueId(), friendlyByteBuf.readBoolean());
+    @Override
+    public Boolean parse(UUID playerUuid, int protocolVersion, RegistryFriendlyByteBuf friendlyByteBuf) {
+        return friendlyByteBuf.readBoolean();
+    }
+
+    @Override
+    public void apply(Player player, Boolean value) {
+        this.plugin.setNoPhysicalTrigger(player.getUniqueId(), value);
     }
 
 }
+

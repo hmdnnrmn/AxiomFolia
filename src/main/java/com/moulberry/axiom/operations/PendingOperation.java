@@ -9,4 +9,7 @@ public interface PendingOperation {
     void tick(ServerLevel level);
     ServerPlayer executor();
 
+    default void startFolia(net.minecraft.server.level.ServerLevel level, Runnable onComplete) {
+        onComplete.run();
+    }
 }

@@ -4,17 +4,14 @@ import com.moulberry.axiom.AxiomPaper;
 import com.moulberry.axiom.event.AxiomFlySpeedChangeEvent;
 import com.moulberry.axiom.packet.PacketHandler;
 import com.moulberry.axiom.restrictions.AxiomPermission;
-import io.netty.buffer.Unpooled;
-import net.kyori.adventure.text.Component;
-import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import org.bukkit.Bukkit;
 import org.bukkit.craftbukkit.entity.CraftPlayer;
 import org.bukkit.entity.Player;
-import org.bukkit.plugin.messaging.PluginMessageListener;
-import org.jetbrains.annotations.NotNull;
 
-public class SetFlySpeedPacketListener implements PacketHandler {
+import java.util.UUID;
+
+public class SetFlySpeedPacketListener implements PacketHandler<Float> {
 
     private final AxiomPaper plugin;
     public SetFlySpeedPacketListener(AxiomPaper plugin) {
@@ -22,15 +19,18 @@ public class SetFlySpeedPacketListener implements PacketHandler {
     }
 
     @Override
-    public void onReceive(Player player, RegistryFriendlyByteBuf friendlyByteBuf) {
-        if (!this.plugin.canUseAxiom(player, AxiomPermission.PLAYER_SPEED)) {
-            return;
-        }
+    public boolean precheck(Player player, AxiomPaper plugin, RegistryFriendlyByteBuf friendlyByteBuf) {
+        return this.plugin.canUseAxiom(player, AxiomPermission.PLAYER_SPEED);
+    }
 
+    @Override
+    public Float parse(UUID playerUuid, int protocolVersion, RegistryFriendlyByteBuf friendlyByteBuf) {
         float flySpeed = friendlyByteBuf.readFloat();
+        return Math.max(-1.0f, Math.min(1.0f, flySpeed));
+    }
 
-        flySpeed = Math.max(-1.0f, Math.min(1.0f, flySpeed));
-
+    @Override
+    public void apply(Player player, Float flySpeed) {
         // Call event
         AxiomFlySpeedChangeEvent flySpeedChangeEvent = new AxiomFlySpeedChangeEvent(player, flySpeed);
         Bukkit.getPluginManager().callEvent(flySpeedChangeEvent);
@@ -41,3 +41,4 @@ public class SetFlySpeedPacketListener implements PacketHandler {
     }
 
 }
+

@@ -24,6 +24,7 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
@@ -31,8 +32,8 @@ public class BlockBuffer {
 
     public static final BlockState EMPTY_STATE = Blocks.VOID_AIR.defaultBlockState();
 
-    private static final Map<BlockState, Codec<PalettedContainer<BlockState>>> BLOCK_STATE_CODECS = new HashMap<>();
-    private static final Map<BlockState, IdMap<BlockState>> ID_MAPPERS = new HashMap<>();
+    private static final Map<BlockState, Codec<PalettedContainer<BlockState>>> BLOCK_STATE_CODECS = new ConcurrentHashMap<>();
+    private static final Map<BlockState, IdMap<BlockState>> ID_MAPPERS = new ConcurrentHashMap<>();
 
     public static PalettedContainer<BlockState> createPalettedContainerForEmptyBlockState(BlockState emptyBlockState) {
         return VersionHelper.createPalettedContainer(BlockBuffer.getIdMapForEmptyBlockState(emptyBlockState), EMPTY_STATE);
@@ -89,7 +90,7 @@ public class BlockBuffer {
         this.registry = registry;
     }
 
-    public static BlockBuffer load(FriendlyByteBuf friendlyByteBuf, IdMapper<BlockState> registry, Player player) {
+    public static BlockBuffer load(FriendlyByteBuf friendlyByteBuf, IdMapper<BlockState> registry, int protocolVersion) {
         BlockBuffer buffer = new BlockBuffer(registry);
 
         long totalBlockEntities = 0;
@@ -100,7 +101,7 @@ public class BlockBuffer {
             if (index == AxiomConstants.MIN_POSITION_LONG) break;
 
             PalettedContainer<BlockState> palettedContainer = buffer.getOrCreateSection(index);
-            UnknownVersionHelper.readPalettedContainerUnknown(friendlyByteBuf, palettedContainer, player);
+            UnknownVersionHelper.readPalettedContainerUnknown(friendlyByteBuf, palettedContainer, protocolVersion);
 
             int blockEntitySize = Math.min(4096, friendlyByteBuf.readVarInt());
             if (blockEntitySize > 0) {

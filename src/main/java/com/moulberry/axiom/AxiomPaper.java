@@ -68,6 +68,9 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.function.IntFunction;
 
 public class AxiomPaper extends JavaPlugin implements Listener {
@@ -79,12 +82,14 @@ public class AxiomPaper extends JavaPlugin implements Listener {
     public final Map<UUID, Restrictions> playerRestrictions = new ConcurrentHashMap<>();
     public final Map<UUID, IdMapper<BlockState>> playerBlockRegistry = new ConcurrentHashMap<>();
     public final Map<UUID, Integer> playerProtocolVersion = new ConcurrentHashMap<>();
-    private final Map<UUID, AxiomPermissionSet> playerPermissions = new HashMap<>();
-    private final Map<UUID, PlotSquaredIntegration.PlotBounds> lastPlotBoundsForPlayers = new HashMap<>();
-    private final Set<UUID> noPhysicalTriggerPlayers = new HashSet<>();
+    public final ConcurrentHashMap<UUID, java.util.concurrent.CompletableFuture<Void>> playerPacketChainMap = new ConcurrentHashMap<>();
+    private final Map<UUID, AxiomPermissionSet> playerPermissions = new ConcurrentHashMap<>();
+    private final Map<UUID, PlotSquaredIntegration.PlotBounds> lastPlotBoundsForPlayers = new ConcurrentHashMap<>();
+    private final Set<UUID> noPhysicalTriggerPlayers = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private final OperationQueue operationQueue = new OperationQueue();
-    private final Object2IntOpenHashMap<UUID> availableDispatchSends = new Object2IntOpenHashMap<>();
+    private final ConcurrentHashMap<UUID, Integer> availableDispatchSends = new ConcurrentHashMap<>();
     public Configuration configuration;
+    private ExecutorService asyncExecutor;
 
     public IdMapper<BlockState> allowedBlockRegistry = null;
     private boolean logLargeBlockBufferChanges = false;
@@ -177,7 +182,7 @@ public class AxiomPaper extends JavaPlugin implements Listener {
         msg.registerOutgoingPluginChannel(this, "axiom:ignore_display_entities");
         msg.registerOutgoingPluginChannel(this, "axiom:register_custom_items");
 
-        Map<String, PacketHandler> largePayloadHandlers = new HashMap<>();
+        Map<String, PacketHandler<?>> largePayloadHandlers = new HashMap<>();
 
         registerPacketHandler("hello", new HelloPacketListener(this), msg, LargePayloadBehaviour.FORCE_SMALL, largePayloadHandlers);
         registerPacketHandler("set_gamemode", new SetGamemodePacketListener(this), msg, LargePayloadBehaviour.FORCE_SMALL, largePayloadHandlers);
@@ -244,7 +249,16 @@ public class AxiomPaper extends JavaPlugin implements Listener {
         } catch (IOException ignored) {}
         ServerHeightmaps.load(heightmapsPath);
 
-        Bukkit.getScheduler().scheduleSyncRepeatingTask(this, this::tick, 1, 1);
+        this.asyncExecutor = Executors.newFixedThreadPool(4);
+
+        if (VersionHelper.isFolia()) {
+            Bukkit.getGlobalRegionScheduler().runAtFixedRate(this, task -> this.tick(), 1L, 1L);
+            for (org.bukkit.World world : Bukkit.getWorlds()) {
+                this.registerInitialMarkers(world);
+            }
+        } else {
+            Bukkit.getScheduler().scheduleSyncRepeatingTask(this, this::tick, 1, 1);
+        }
 
         this.sendMarkers = this.configuration.getBoolean("send-markers");
         this.maxChunkRelightsPerTick = this.configuration.getInt("max-chunk-relights-per-tick");
@@ -388,6 +402,24 @@ public class AxiomPaper extends JavaPlugin implements Listener {
         FORCE_SMALL
     }
 
+    @Override
+    public void onDisable() {
+        if (this.asyncExecutor != null) {
+            this.asyncExecutor.shutdown();
+            try {
+                if (!this.asyncExecutor.awaitTermination(3, TimeUnit.SECONDS)) {
+                    this.asyncExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                this.asyncExecutor.shutdownNow();
+            }
+        }
+    }
+
+    public ExecutorService getAsyncExecutor() {
+        return this.asyncExecutor;
+    }
+
     public void clearCachedPermissionsFor(UUID uuid) {
         this.playerPermissions.remove(uuid);
     }
@@ -397,52 +429,108 @@ public class AxiomPaper extends JavaPlugin implements Listener {
             this.playerPermissions.clear();
         }
 
-        this.checkAxiomEnableDisableTimer += 1;
-        if (this.checkAxiomEnableDisableTimer >= 20) {
-            this.checkAxiomEnableDisableTimer = 0;
-
-            Set<UUID> stillActiveAxiomPlayers = new HashSet<>();
-            Set<UUID> stillFailedAxiomPlayers = new HashSet<>();
-
-            for (Player player : Bukkit.getServer().getOnlinePlayers()) {
-                UUID uuid = player.getUniqueId();
-                if (this.activeAxiomPlayers.contains(uuid)) {
-                    if (!this.hasPermission(player, AxiomPermission.USE)) {
-                        FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
-                        buf.writeBoolean(false);
-                        byte[] bytes = ByteBufUtil.getBytes(buf);
-                        VersionHelper.sendCustomPayload(player, "axiom:enable", bytes);
-
-                        this.failedPermissionAxiomPlayers.add(uuid);
-                        stillFailedAxiomPlayers.add(uuid);
-                    } else {
-                        stillActiveAxiomPlayers.add(uuid);
-                        tickPlayer(player, true);
-                    }
-                } else if (this.failedPermissionAxiomPlayers.contains(uuid)) {
-                    if (this.hasPermission(player, AxiomPermission.USE)) {
-                        VersionHelper.sendCustomPayload(player, "axiom:redo_handshake", new byte[]{});
-                        this.failedPermissionAxiomPlayers.remove(uuid);
-                    } else {
-                        stillFailedAxiomPlayers.add(uuid);
-                    }
-                }
+        if (VersionHelper.isFolia()) {
+            this.checkAxiomEnableDisableTimer += 1;
+            boolean isCheckTick = this.checkAxiomEnableDisableTimer >= 20;
+            if (isCheckTick) {
+                this.checkAxiomEnableDisableTimer = 0;
             }
 
-            this.activeAxiomPlayers.retainAll(stillActiveAxiomPlayers);
-            this.availableDispatchSends.keySet().retainAll(stillActiveAxiomPlayers);
-            this.playerRestrictions.keySet().retainAll(stillActiveAxiomPlayers);
-            this.playerBlockRegistry.keySet().retainAll(stillActiveAxiomPlayers);
-            this.playerProtocolVersion.keySet().retainAll(stillActiveAxiomPlayers);
-            this.lastPlotBoundsForPlayers.keySet().retainAll(stillActiveAxiomPlayers);
-            this.noPhysicalTriggerPlayers.retainAll(stillActiveAxiomPlayers);
+            Set<UUID> onlineUuids = new HashSet<>();
+            for (Player player : Bukkit.getServer().getOnlinePlayers()) {
+                onlineUuids.add(player.getUniqueId());
+            }
 
-            this.failedPermissionAxiomPlayers.retainAll(stillFailedAxiomPlayers);
+            this.activeAxiomPlayers.retainAll(onlineUuids);
+            this.failedPermissionAxiomPlayers.retainAll(onlineUuids);
+            this.availableDispatchSends.keySet().retainAll(onlineUuids);
+            this.playerRestrictions.keySet().retainAll(onlineUuids);
+            this.playerBlockRegistry.keySet().retainAll(onlineUuids);
+            this.playerProtocolVersion.keySet().retainAll(onlineUuids);
+            this.playerPacketChainMap.keySet().retainAll(onlineUuids);
+            this.lastPlotBoundsForPlayers.keySet().retainAll(onlineUuids);
+            this.noPhysicalTriggerPlayers.retainAll(onlineUuids);
+
+            for (Player player : Bukkit.getServer().getOnlinePlayers()) {
+                player.getScheduler().run(this, task -> {
+                    if (!player.isOnline()) return;
+                    UUID uuid = player.getUniqueId();
+                    if (this.activeAxiomPlayers.contains(uuid)) {
+                        if (isCheckTick && !this.hasPermission(player, AxiomPermission.USE)) {
+                            FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+                            buf.writeBoolean(false);
+                            byte[] bytes = ByteBufUtil.getBytes(buf);
+                            VersionHelper.sendCustomPayload(player, "axiom:enable", bytes);
+
+                            this.activeAxiomPlayers.remove(uuid);
+                            this.failedPermissionAxiomPlayers.add(uuid);
+                            this.availableDispatchSends.remove(uuid);
+                            this.playerRestrictions.remove(uuid);
+                            this.playerBlockRegistry.remove(uuid);
+                            this.playerProtocolVersion.remove(uuid);
+                            this.lastPlotBoundsForPlayers.remove(uuid);
+                            this.noPhysicalTriggerPlayers.remove(uuid);
+                        } else {
+                            tickPlayer(player, isCheckTick);
+                        }
+                    } else if (this.failedPermissionAxiomPlayers.contains(uuid)) {
+                        if (isCheckTick) {
+                            if (this.hasPermission(player, AxiomPermission.USE)) {
+                                VersionHelper.sendCustomPayload(player, "axiom:redo_handshake", new byte[]{});
+                                this.failedPermissionAxiomPlayers.remove(uuid);
+                            }
+                        }
+                    }
+                }, null);
+            }
         } else {
-            for (UUID uuid : this.activeAxiomPlayers) {
-                Player player = Bukkit.getPlayer(uuid);
-                if (player != null) {
-                    tickPlayer(player, false);
+            this.checkAxiomEnableDisableTimer += 1;
+            if (this.checkAxiomEnableDisableTimer >= 20) {
+                this.checkAxiomEnableDisableTimer = 0;
+
+                Set<UUID> stillActiveAxiomPlayers = new HashSet<>();
+                Set<UUID> stillFailedAxiomPlayers = new HashSet<>();
+
+                for (Player player : Bukkit.getServer().getOnlinePlayers()) {
+                    UUID uuid = player.getUniqueId();
+                    if (this.activeAxiomPlayers.contains(uuid)) {
+                        if (!this.hasPermission(player, AxiomPermission.USE)) {
+                            FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+                            buf.writeBoolean(false);
+                            byte[] bytes = ByteBufUtil.getBytes(buf);
+                            VersionHelper.sendCustomPayload(player, "axiom:enable", bytes);
+
+                            this.failedPermissionAxiomPlayers.add(uuid);
+                            stillFailedAxiomPlayers.add(uuid);
+                        } else {
+                            stillActiveAxiomPlayers.add(uuid);
+                            tickPlayer(player, true);
+                        }
+                    } else if (this.failedPermissionAxiomPlayers.contains(uuid)) {
+                        if (this.hasPermission(player, AxiomPermission.USE)) {
+                            VersionHelper.sendCustomPayload(player, "axiom:redo_handshake", new byte[]{});
+                            this.failedPermissionAxiomPlayers.remove(uuid);
+                        } else {
+                            stillFailedAxiomPlayers.add(uuid);
+                        }
+                    }
+                }
+
+                this.activeAxiomPlayers.retainAll(stillActiveAxiomPlayers);
+                this.availableDispatchSends.keySet().retainAll(stillActiveAxiomPlayers);
+                this.playerRestrictions.keySet().retainAll(stillActiveAxiomPlayers);
+                this.playerBlockRegistry.keySet().retainAll(stillActiveAxiomPlayers);
+                this.playerProtocolVersion.keySet().retainAll(stillActiveAxiomPlayers);
+                this.lastPlotBoundsForPlayers.keySet().retainAll(stillActiveAxiomPlayers);
+                this.noPhysicalTriggerPlayers.retainAll(stillActiveAxiomPlayers);
+
+                this.failedPermissionAxiomPlayers.retainAll(stillFailedAxiomPlayers);
+            } else {
+                for (UUID uuid : this.activeAxiomPlayers) {
+                    Player player = Bukkit.getPlayer(uuid);
+                    if (player != null) {
+                        tickPlayer(player, false);
+                    }
                 }
             }
         }
@@ -502,7 +590,7 @@ public class AxiomPaper extends JavaPlugin implements Listener {
             this.availableDispatchSends.put(player.getUniqueId(), allowedDispatchSendsPerSecond*20);
             sendUpdateAvailableDispatchSends(player, allowedDispatchSendsPerSecond, allowedDispatchSendsPerSecond);
         } else {
-            int previousAllowed20 = this.availableDispatchSends.getInt(player.getUniqueId());
+            int previousAllowed20 = this.availableDispatchSends.get(player.getUniqueId());
             int newAllowed20 = Math.min(allowedDispatchSendsPerSecond*20, previousAllowed20 + allowedDispatchSendsPerSecond);
             this.availableDispatchSends.put(player.getUniqueId(), newAllowed20);
 
@@ -612,8 +700,8 @@ public class AxiomPaper extends JavaPlugin implements Listener {
         return restrictions;
     }
 
-    private void registerPacketHandler(String name, PacketHandler handler, Messenger messenger, LargePayloadBehaviour behaviour,
-                                       Map<String, PacketHandler> largePayloadHandlers) {
+    private void registerPacketHandler(String name, PacketHandler<?> handler, Messenger messenger, LargePayloadBehaviour behaviour,
+                                       Map<String, PacketHandler<?>> largePayloadHandlers) {
         boolean isLargePayload = switch (behaviour) {
             case DEFAULT -> this.configuration.getBoolean("allow-large-payload-for-all-packets");
             case FORCE_LARGE -> true;
@@ -727,14 +815,25 @@ public class AxiomPaper extends JavaPlugin implements Listener {
     private final WeakHashMap<World, ServerWorldPropertiesRegistry> worldProperties = new WeakHashMap<>();
 
     public @Nullable ServerWorldPropertiesRegistry getWorldPropertiesIfPresent(World world) {
-        return worldProperties.get(world);
+        synchronized (worldProperties) {
+            return worldProperties.get(world);
+        }
     }
 
     public @Nullable ServerWorldPropertiesRegistry getOrCreateWorldProperties(World world) {
-        if (worldProperties.containsKey(world)) {
-            return worldProperties.get(world);
-        } else {
-            ServerWorldPropertiesRegistry properties = createWorldProperties(world);
+        synchronized (worldProperties) {
+            ServerWorldPropertiesRegistry existing = worldProperties.get(world);
+            if (existing != null) {
+                return existing;
+            }
+        }
+        ServerWorldPropertiesRegistry properties = createWorldProperties(world);
+        if (properties == null) return null;
+        synchronized (worldProperties) {
+            ServerWorldPropertiesRegistry existing = worldProperties.get(world);
+            if (existing != null) {
+                return existing;
+            }
             worldProperties.put(world, properties);
             return properties;
         }
@@ -817,6 +916,69 @@ public class AxiomPaper extends JavaPlugin implements Listener {
         if (createEvent.isCancelled()) return null;
 
         return registry;
+    }
+
+    private void registerInitialMarkers(org.bukkit.World world) {
+        for (org.bukkit.Chunk chunk : world.getLoadedChunks()) {
+            org.bukkit.Bukkit.getRegionScheduler().run(this, world, chunk.getX(), chunk.getZ(), task -> {
+                org.bukkit.craftbukkit.CraftWorld craftWorld = (org.bukkit.craftbukkit.CraftWorld) world;
+                WorldExtension ext = WorldExtension.get(craftWorld.getHandle());
+                for (org.bukkit.entity.Entity entity : chunk.getEntities()) {
+                    if (entity instanceof org.bukkit.entity.Marker) {
+                        ext.addMarker(entity.getUniqueId());
+                    }
+                }
+            });
+        }
+    }
+
+    @EventHandler
+    public void onWorldLoad(org.bukkit.event.world.WorldLoadEvent event) {
+        if (VersionHelper.isFolia()) {
+            this.registerInitialMarkers(event.getWorld());
+        }
+    }
+
+    @EventHandler
+    public void onEntitySpawn(org.bukkit.event.entity.EntitySpawnEvent event) {
+        if (VersionHelper.isFolia() && event.getEntity() instanceof org.bukkit.entity.Marker) {
+            org.bukkit.craftbukkit.CraftWorld craftWorld = (org.bukkit.craftbukkit.CraftWorld) event.getEntity().getWorld();
+            WorldExtension.get(craftWorld.getHandle()).addMarker(event.getEntity().getUniqueId());
+        }
+    }
+
+    @EventHandler
+    public void onEntityRemove(org.bukkit.event.entity.EntityRemoveEvent event) {
+        if (VersionHelper.isFolia() && event.getEntity() instanceof org.bukkit.entity.Marker) {
+            org.bukkit.craftbukkit.CraftWorld craftWorld = (org.bukkit.craftbukkit.CraftWorld) event.getEntity().getWorld();
+            WorldExtension.get(craftWorld.getHandle()).removeMarker(event.getEntity().getUniqueId());
+        }
+    }
+
+    @EventHandler
+    public void onEntitiesLoad(org.bukkit.event.world.EntitiesLoadEvent event) {
+        if (VersionHelper.isFolia()) {
+            org.bukkit.craftbukkit.CraftWorld craftWorld = (org.bukkit.craftbukkit.CraftWorld) event.getWorld();
+            WorldExtension ext = WorldExtension.get(craftWorld.getHandle());
+            for (org.bukkit.entity.Entity entity : event.getEntities()) {
+                if (entity instanceof org.bukkit.entity.Marker) {
+                    ext.addMarker(entity.getUniqueId());
+                }
+            }
+        }
+    }
+
+    @EventHandler
+    public void onEntitiesUnload(org.bukkit.event.world.EntitiesUnloadEvent event) {
+        if (VersionHelper.isFolia()) {
+            org.bukkit.craftbukkit.CraftWorld craftWorld = (org.bukkit.craftbukkit.CraftWorld) event.getWorld();
+            WorldExtension ext = WorldExtension.get(craftWorld.getHandle());
+            for (org.bukkit.entity.Entity entity : event.getEntities()) {
+                if (entity instanceof org.bukkit.entity.Marker) {
+                    ext.removeMarker(entity.getUniqueId());
+                }
+            }
+        }
     }
 
 }

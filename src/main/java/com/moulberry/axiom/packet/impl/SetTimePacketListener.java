@@ -1,12 +1,11 @@
 package com.moulberry.axiom.packet.impl;
 
 import com.moulberry.axiom.AxiomPaper;
+import com.moulberry.axiom.VersionHelper;
 import com.moulberry.axiom.event.AxiomTimeChangeEvent;
 import com.moulberry.axiom.integration.plotsquared.PlotSquaredIntegration;
 import com.moulberry.axiom.packet.PacketHandler;
 import com.moulberry.axiom.restrictions.AxiomPermission;
-import io.netty.buffer.Unpooled;
-import net.kyori.adventure.text.Component;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.RegistryFriendlyByteBuf;
@@ -17,49 +16,68 @@ import net.minecraft.world.level.Level;
 import org.bukkit.Bukkit;
 import org.bukkit.craftbukkit.CraftWorld;
 import org.bukkit.entity.Player;
-import org.bukkit.plugin.messaging.PluginMessageListener;
-import org.jetbrains.annotations.NotNull;
 
-public class SetTimePacketListener implements PacketHandler {
+import java.util.UUID;
+
+public class SetTimePacketListener implements PacketHandler<SetTimePacketListener.Parsed> {
 
     private final AxiomPaper plugin;
     public SetTimePacketListener(AxiomPaper plugin) {
         this.plugin = plugin;
     }
 
+    public record Parsed(ResourceKey<Level> key, Integer time, Boolean freezeTime) {}
+
     @Override
-    public void onReceive(Player player, RegistryFriendlyByteBuf friendlyByteBuf) {
+    public boolean precheck(Player player, AxiomPaper plugin, RegistryFriendlyByteBuf friendlyByteBuf) {
         if (!this.plugin.canUseAxiom(player, AxiomPermission.WORLD_TIME)) {
-            return;
+            return false;
         }
-
-        ResourceKey<Level> key = friendlyByteBuf.readResourceKey(Registries.DIMENSION);
-        Integer time = friendlyByteBuf.readNullable(FriendlyByteBuf::readInt);
-        Boolean freezeTime = friendlyByteBuf.readNullable(FriendlyByteBuf::readBoolean);
-
-        if (time == null && freezeTime == null) return;
-
-        ServerLevel level = ((CraftWorld)player.getWorld()).getHandle();
-        if (!level.dimension().equals(key)) return;
 
         // Don't allow on plot worlds
         if (PlotSquaredIntegration.isPlotWorld(player.getWorld())) {
-            return;
+            return false;
         }
 
         // Call modify world
         if (!this.plugin.canModifyWorld(player, player.getWorld())) {
-            return;
+            return false;
         }
 
+        return true;
+    }
+
+    @Override
+    public Parsed parse(UUID playerUuid, int protocolVersion, RegistryFriendlyByteBuf friendlyByteBuf) {
+        ResourceKey<Level> key = friendlyByteBuf.readResourceKey(Registries.DIMENSION);
+        Integer time = friendlyByteBuf.readNullable(FriendlyByteBuf::readInt);
+        Boolean freezeTime = friendlyByteBuf.readNullable(FriendlyByteBuf::readBoolean);
+        return new Parsed(key, time, freezeTime);
+    }
+
+    @Override
+    public void apply(Player player, Parsed parsed) {
+        if (parsed == null) return;
+        if (parsed.time() == null && parsed.freezeTime() == null) return;
+
+        ServerLevel level = ((CraftWorld)player.getWorld()).getHandle();
+        if (!level.dimension().equals(parsed.key())) return;
+
         // Call time change event
-        AxiomTimeChangeEvent timeChangeEvent = new AxiomTimeChangeEvent(player, time, freezeTime);
+        AxiomTimeChangeEvent timeChangeEvent = new AxiomTimeChangeEvent(player, parsed.time(), parsed.freezeTime());
         Bukkit.getPluginManager().callEvent(timeChangeEvent);
         if (timeChangeEvent.isCancelled()) return;
 
         // Change time
-        if (time != null) player.getWorld().setTime(time);
-        if (freezeTime != null) level.getGameRules().set(GameRules.ADVANCE_TIME, !freezeTime, null);
+        if (VersionHelper.isFolia()) {
+            Bukkit.getGlobalRegionScheduler().run(this.plugin, task -> {
+                if (parsed.time() != null) player.getWorld().setTime(parsed.time());
+                if (parsed.freezeTime() != null) level.getGameRules().set(GameRules.ADVANCE_TIME, !parsed.freezeTime(), null);
+            });
+        } else {
+            if (parsed.time() != null) player.getWorld().setTime(parsed.time());
+            if (parsed.freezeTime() != null) level.getGameRules().set(GameRules.ADVANCE_TIME, !parsed.freezeTime(), null);
+        }
     }
 
 }

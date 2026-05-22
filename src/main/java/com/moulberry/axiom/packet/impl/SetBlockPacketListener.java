@@ -4,6 +4,7 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.moulberry.axiom.AxiomPaper;
 import com.moulberry.axiom.AxiomReflection;
+import com.moulberry.axiom.VersionHelper;
 import com.moulberry.axiom.integration.Integration;
 import com.moulberry.axiom.integration.coreprotect.CoreProtectIntegration;
 import com.moulberry.axiom.packet.PacketHandler;
@@ -22,6 +23,7 @@ import net.minecraft.world.entity.ai.village.poi.PoiTypes;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.context.BlockPlaceContext;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
@@ -52,9 +54,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.function.IntFunction;
 
-public class SetBlockPacketListener implements PacketHandler {
+public class SetBlockPacketListener implements PacketHandler<SetBlockPacketListener.ParsedPayload> {
 
     public static final int REASON_REPLACEMODE = 1;
     public static final int REASON_ANGEL = 128;
@@ -71,19 +74,31 @@ public class SetBlockPacketListener implements PacketHandler {
         }
     }
 
+    public record ParsedPayload(
+        Map<BlockPos, BlockState> blocks,
+        boolean updateNeighbors,
+        Set<BlockPos> preventUpdatesAt,
+        int reason,
+        boolean breaking,
+        BlockHitResult blockHit,
+        InteractionHand hand,
+        int sequenceId
+    ) {}
+
     @Override
-    public void onReceive(Player bukkitPlayer, RegistryFriendlyByteBuf friendlyByteBuf) {
-        if (!this.plugin.canUseAxiom(bukkitPlayer, AxiomPermission.BUILD_PLACE)) {
-            return;
-        }
+    public boolean handleAsync() {
+        return true;
+    }
 
-        if (!this.plugin.canModifyWorld(bukkitPlayer, bukkitPlayer.getWorld())) {
-            return;
-        }
+    @Override
+    public boolean precheck(Player player, AxiomPaper plugin, RegistryFriendlyByteBuf friendlyByteBuf) {
+        return plugin.canUseAxiom(player, AxiomPermission.BUILD_PLACE) && plugin.canModifyWorld(player, player.getWorld());
+    }
 
-        // Read packet
+    @Override
+    public ParsedPayload parse(UUID playerUuid, int protocolVersion, RegistryFriendlyByteBuf friendlyByteBuf) {
         IntFunction<Map<BlockPos, BlockState>> mapFunction = this.plugin.limitCollection(Maps::newLinkedHashMapWithExpectedSize);
-        IdMapper<BlockState> registry = this.plugin.getBlockRegistry(bukkitPlayer.getUniqueId());
+        IdMapper<BlockState> registry = this.plugin.getBlockRegistry(playerUuid);
         Map<BlockPos, BlockState> blocks = friendlyByteBuf.readMap(mapFunction,
                 buf -> buf.readBlockPos(), buf -> buf.readById(registry::byIdOrThrow));
         boolean updateNeighbors = friendlyByteBuf.readBoolean();
@@ -93,35 +108,221 @@ public class SetBlockPacketListener implements PacketHandler {
             preventUpdatesAt = friendlyByteBuf.readCollection(setFunction, buf -> buf.readBlockPos());
         }
 
-        if (this.plugin.logLargeBlockBufferChanges() && blocks.size() > 64) {
-            this.plugin.getLogger().info("Player " + bukkitPlayer.getUniqueId() + " modified " + blocks.size() + " individual blocks with axiom");
-        }
-
         int reason = friendlyByteBuf.readVarInt();
         boolean breaking = friendlyByteBuf.readBoolean();
         BlockHitResult blockHit = friendlyByteBuf.readBlockHitResult();
         InteractionHand hand = friendlyByteBuf.readEnum(InteractionHand.class);
         int sequenceId = friendlyByteBuf.readVarInt();
 
+        return new ParsedPayload(blocks, updateNeighbors, preventUpdatesAt, reason, breaking, blockHit, hand, sequenceId);
+    }
+
+    @Override
+    public void apply(Player bukkitPlayer, ParsedPayload parsed) {
         ServerPlayer player = ((CraftPlayer)bukkitPlayer).getHandle();
         CraftWorld world = player.level().getWorld();
 
-        if (sequenceId >= 0) {
-            player.connection.ackBlockChangesUpTo(sequenceId);
+        if (parsed.sequenceId >= 0) {
+            player.connection.ackBlockChangesUpTo(parsed.sequenceId);
         }
 
-        BlockPlaceContext blockPlaceContext = new BlockPlaceContext(player, hand, player.getItemInHand(hand), blockHit);
+        BlockPlaceContext blockPlaceContext = new BlockPlaceContext(player, parsed.hand, player.getItemInHand(parsed.hand), parsed.blockHit);
+        BlockPos clickedPos = blockPlaceContext.getClickedPos();
 
-        if ((reason & REASON_REPLACEMODE) == 0 && (reason & REASON_ANGEL) == 0) {
-            if (!fireBukkitEvents(bukkitPlayer, blockHit, breaking, blocks, player, world, hand)) {
+        if (this.plugin.logLargeBlockBufferChanges() && parsed.blocks.size() > 64) {
+            this.plugin.getLogger().info("Player " + bukkitPlayer.getUniqueId() + " modified " + parsed.blocks.size() + " individual blocks with axiom");
+        }
+
+        if (VersionHelper.isFolia()) {
+            java.util.Map<ChunkPos, java.util.Map<BlockPos, BlockState>> blocksByChunk = new java.util.HashMap<>();
+            for (Map.Entry<BlockPos, BlockState> entry : parsed.blocks.entrySet()) {
+                BlockPos pos = entry.getKey();
+                ChunkPos chunkPos = new ChunkPos(pos.getX() >> 4, pos.getZ() >> 4);
+                blocksByChunk.computeIfAbsent(chunkPos, k -> new java.util.LinkedHashMap<>()).put(pos, entry.getValue());
+            }
+
+            int clickedCx = clickedPos.getX() >> 4;
+            int clickedCz = clickedPos.getZ() >> 4;
+
+            org.bukkit.Bukkit.getRegionScheduler().run(this.plugin, world, clickedCx, clickedCz, clickedTask -> {
+                if (player.hasDisconnected()) return;
+
+                boolean eventsPassed = true;
+                if ((parsed.reason & REASON_REPLACEMODE) == 0 && (parsed.reason & REASON_ANGEL) == 0) {
+                    org.bukkit.inventory.ItemStack heldItem;
+                    if (parsed.hand == InteractionHand.MAIN_HAND) {
+                        heldItem = bukkitPlayer.getInventory().getItemInMainHand();
+                    } else {
+                        heldItem = bukkitPlayer.getInventory().getItemInOffHand();
+                    }
+
+                    org.bukkit.block.Block blockClicked = world.getBlockAt(clickedPos.getX(), clickedPos.getY(), clickedPos.getZ());
+                    BlockFace blockFace = CraftBlock.notchToBlockFace(parsed.blockHit.getDirection());
+
+                    PlayerInteractEvent playerInteractEvent = new PlayerInteractEvent(bukkitPlayer,
+                        parsed.breaking ? Action.LEFT_CLICK_BLOCK : Action.RIGHT_CLICK_BLOCK, heldItem, blockClicked, blockFace);
+                    if (!playerInteractEvent.callEvent()) {
+                        eventsPassed = false;
+                    }
+                }
+
+                if (!eventsPassed) return;
+
+                for (java.util.Map.Entry<ChunkPos, java.util.Map<BlockPos, BlockState>> chunkEntry : blocksByChunk.entrySet()) {
+                    ChunkPos chunkPos = chunkEntry.getKey();
+                    java.util.Map<BlockPos, BlockState> chunkBlocks = chunkEntry.getValue();
+
+                    org.bukkit.Bukkit.getRegionScheduler().run(this.plugin, world, chunkPos.x(), chunkPos.z(), chunkTask -> {
+                        if (player.hasDisconnected()) return;
+
+                        if ((parsed.reason & REASON_REPLACEMODE) == 0 && (parsed.reason & REASON_ANGEL) == 0 && !parsed.breaking) {
+                            List<org.bukkit.block.BlockState> blockStates = new ArrayList<>();
+                            for (Map.Entry<BlockPos, BlockState> entry : chunkBlocks.entrySet()) {
+                                BlockState existing = player.level().getBlockState(entry.getKey());
+                                if (existing.canBeReplaced()) {
+                                    blockStates.add(new AxiomPlacingCraftBlockState(world, entry.getKey(), entry.getValue()));
+                                }
+                            }
+
+                            if (!blockStates.isEmpty()) {
+                                Cancellable event;
+                                if (blockStates.size() > 1) {
+                                    event = CraftEventFactory.callBlockMultiPlaceEvent(player.level(),
+                                        player, parsed.hand, blockStates, clickedPos);
+                                } else {
+                                    event = CraftEventFactory.callBlockPlaceEvent(player.level(),
+                                        player, parsed.hand, blockStates.get(0), clickedPos);
+                                }
+                                if (event.isCancelled()) {
+                                    return;
+                                }
+                            }
+                        }
+
+                        if (parsed.updateNeighbors) {
+                            if (parsed.preventUpdatesAt.isEmpty()) {
+                                for (Map.Entry<BlockPos, BlockState> entry : chunkBlocks.entrySet()) {
+                                    BlockPos blockPos = entry.getKey();
+                                    BlockState blockState = entry.getValue();
+
+                                    if (!canBreakOrPlace(bukkitPlayer, blockState, world, blockPos)) {
+                                        continue;
+                                    }
+
+                                    boolean logPlacement = false;
+                                    if (CoreProtectIntegration.isEnabled()) {
+                                        BlockState old = player.level().getBlockState(blockPos);
+                                        if (old != blockState) {
+                                            CoreProtectIntegration.logRemoval(bukkitPlayer.getName(), old, world, blockPos);
+                                            logPlacement = true;
+                                        }
+                                    }
+
+                                    player.level().setBlock(blockPos, blockState, 3);
+
+                                    if (logPlacement) {
+                                        CoreProtectIntegration.logPlacement(bukkitPlayer.getName(), blockState, world, blockPos);
+                                    }
+                                }
+                            } else {
+                                Direction[] directions = Direction.values();
+                                BlockPos.MutableBlockPos mutable = new BlockPos.MutableBlockPos();
+                                Map<BlockPos, BlockState> delayedSetWithoutUpdates = new LinkedHashMap<>(Math.min(chunkBlocks.size(), parsed.preventUpdatesAt.size()));
+                                for (Map.Entry<BlockPos, BlockState> entry : chunkBlocks.entrySet()) {
+                                    BlockPos blockPos = entry.getKey();
+                                    BlockState blockState = entry.getValue();
+
+                                    if (!canBreakOrPlace(bukkitPlayer, blockState, world, blockPos)) {
+                                        continue;
+                                    }
+
+                                    boolean updateNeighborsForThisBlock = true;
+                                    for (Direction direction : directions) {
+                                        if (parsed.preventUpdatesAt.contains(mutable.setWithOffset(blockPos, direction))) {
+                                            updateNeighborsForThisBlock = false;
+                                            break;
+                                        }
+                                    }
+
+                                    if (parsed.preventUpdatesAt.contains(blockPos)) {
+                                        delayedSetWithoutUpdates.put(blockPos, blockState);
+                                        if (!updateNeighborsForThisBlock) {
+                                            continue;
+                                        }
+                                    }
+
+                                    boolean logPlacement = false;
+                                    if (CoreProtectIntegration.isEnabled()) {
+                                        BlockState old = player.level().getBlockState(blockPos);
+                                        if (old != blockState) {
+                                            CoreProtectIntegration.logRemoval(bukkitPlayer.getName(), old, world, blockPos);
+                                            logPlacement = true;
+                                        }
+                                    }
+
+                                    player.level().setBlock(blockPos, blockState, updateNeighborsForThisBlock ? 3 : 18);
+
+                                    if (logPlacement) {
+                                        CoreProtectIntegration.logPlacement(bukkitPlayer.getName(), blockState, world, blockPos);
+                                    }
+                                }
+                                for (Map.Entry<BlockPos, BlockState> entry : delayedSetWithoutUpdates.entrySet()) {
+                                    setWithoutUpdates(bukkitPlayer, entry.getValue(), world, entry.getKey(), player);
+                                }
+                            }
+                        } else {
+                            for (Map.Entry<BlockPos, BlockState> entry : chunkBlocks.entrySet()) {
+                                BlockPos blockPos = entry.getKey();
+                                BlockState blockState = entry.getValue();
+
+                                setWithoutUpdates(bukkitPlayer, blockState, world, blockPos, player);
+                            }
+                        }
+
+                        if (!parsed.breaking && chunkBlocks.containsKey(clickedPos)) {
+                            if (!player.level().isLoaded(clickedPos)) {
+                                return;
+                            }
+
+                            BlockState desiredBlockState = chunkBlocks.get(clickedPos);
+                            BlockState actualBlockState = player.level().getBlockState(clickedPos);
+                            Block actualBlock = actualBlockState.getBlock();
+
+                            if (desiredBlockState == null || desiredBlockState.isAir() || actualBlockState.isAir()) return;
+                            if (desiredBlockState.getBlock() != actualBlock) return;
+
+                            if (!Integration.canPlaceBlock(bukkitPlayer, new Location(world, clickedPos.getX(), clickedPos.getY(), clickedPos.getZ()))) {
+                                return;
+                            }
+
+                            ItemStack inHand = player.getItemInHand(parsed.hand);
+                            BlockItem.updateCustomBlockEntityTag(player.level(), player, clickedPos, inHand);
+
+                            BlockEntity blockEntity = player.level().getBlockEntity(clickedPos);
+                            if (blockEntity != null) {
+                                blockEntity.applyComponentsFromItemStack(inHand);
+                            }
+
+                            if (!(actualBlock instanceof BedBlock) && !(actualBlock instanceof DoublePlantBlock) && !(actualBlock instanceof DoorBlock)) {
+                                actualBlock.setPlacedBy(player.level(), clickedPos, actualBlockState, player, inHand);
+                            }
+                        }
+                    });
+                }
+            });
+            return;
+        }
+
+        // Non-Folia path
+        if ((parsed.reason & REASON_REPLACEMODE) == 0 && (parsed.reason & REASON_ANGEL) == 0) {
+            if (!fireBukkitEvents(bukkitPlayer, parsed.blockHit, parsed.breaking, parsed.blocks, player, world, parsed.hand)) {
                 return;
             }
         }
 
-        // Update blocks
-        if (updateNeighbors) {
-            if (preventUpdatesAt.isEmpty()) {
-                for (Map.Entry<BlockPos, BlockState> entry : blocks.entrySet()) {
+        if (parsed.updateNeighbors) {
+            if (parsed.preventUpdatesAt.isEmpty()) {
+                for (Map.Entry<BlockPos, BlockState> entry : parsed.blocks.entrySet()) {
                     BlockPos blockPos = entry.getKey();
                     BlockState blockState = entry.getValue();
 
@@ -130,7 +331,6 @@ public class SetBlockPacketListener implements PacketHandler {
                     }
 
                     boolean logPlacement = false;
-
                     if (CoreProtectIntegration.isEnabled()) {
                         BlockState old = player.level().getBlockState(blockPos);
                         if (old != blockState) {
@@ -139,7 +339,6 @@ public class SetBlockPacketListener implements PacketHandler {
                         }
                     }
 
-                    // Place block
                     player.level().setBlock(blockPos, blockState, 3);
 
                     if (logPlacement) {
@@ -149,8 +348,8 @@ public class SetBlockPacketListener implements PacketHandler {
             } else {
                 Direction[] directions = Direction.values();
                 BlockPos.MutableBlockPos mutable = new BlockPos.MutableBlockPos();
-                Map<BlockPos, BlockState> delayedSetWithoutUpdates = new LinkedHashMap<>(Math.min(blocks.size(), preventUpdatesAt.size()));
-                for (Map.Entry<BlockPos, BlockState> entry : blocks.entrySet()) {
+                Map<BlockPos, BlockState> delayedSetWithoutUpdates = new LinkedHashMap<>(Math.min(parsed.blocks.size(), parsed.preventUpdatesAt.size()));
+                for (Map.Entry<BlockPos, BlockState> entry : parsed.blocks.entrySet()) {
                     BlockPos blockPos = entry.getKey();
                     BlockState blockState = entry.getValue();
 
@@ -158,18 +357,15 @@ public class SetBlockPacketListener implements PacketHandler {
                         continue;
                     }
 
-                    // Check if we have a neighbor that shouldn't receive updates
-                    // Unfortunately this will also prevent updates to ALL the other neighbors,
-                    // but that case is rare enough for it not to matter
                     boolean updateNeighborsForThisBlock = true;
                     for (Direction direction : directions) {
-                        if (preventUpdatesAt.contains(mutable.setWithOffset(blockPos, direction))) {
+                        if (parsed.preventUpdatesAt.contains(mutable.setWithOffset(blockPos, direction))) {
                             updateNeighborsForThisBlock = false;
                             break;
                         }
                     }
 
-                    if (preventUpdatesAt.contains(blockPos)) {
+                    if (parsed.preventUpdatesAt.contains(blockPos)) {
                         delayedSetWithoutUpdates.put(blockPos, blockState);
                         if (!updateNeighborsForThisBlock) {
                             continue;
@@ -177,7 +373,6 @@ public class SetBlockPacketListener implements PacketHandler {
                     }
 
                     boolean logPlacement = false;
-
                     if (CoreProtectIntegration.isEnabled()) {
                         BlockState old = player.level().getBlockState(blockPos);
                         if (old != blockState) {
@@ -197,7 +392,7 @@ public class SetBlockPacketListener implements PacketHandler {
                 }
             }
         } else {
-            for (Map.Entry<BlockPos, BlockState> entry : blocks.entrySet()) {
+            for (Map.Entry<BlockPos, BlockState> entry : parsed.blocks.entrySet()) {
                 BlockPos blockPos = entry.getKey();
                 BlockState blockState = entry.getValue();
 
@@ -205,30 +400,24 @@ public class SetBlockPacketListener implements PacketHandler {
             }
         }
 
-        if (!breaking) {
-            BlockPos clickedPos = blockPlaceContext.getClickedPos();
-
-            if (blocks.containsKey(clickedPos)) {
-                // Disallow in unloaded chunks
+        if (!parsed.breaking) {
+            if (parsed.blocks.containsKey(clickedPos)) {
                 if (!player.level().isLoaded(clickedPos)) {
                     return;
                 }
 
-                BlockState desiredBlockState = blocks.get(clickedPos);
+                BlockState desiredBlockState = parsed.blocks.get(clickedPos);
                 BlockState actualBlockState = player.level().getBlockState(clickedPos);
                 Block actualBlock = actualBlockState.getBlock();
 
-                // Ensure block is correct
                 if (desiredBlockState == null || desiredBlockState.isAir() || actualBlockState.isAir()) return;
                 if (desiredBlockState.getBlock() != actualBlock) return;
 
-                // Check plot squared
                 if (!Integration.canPlaceBlock(bukkitPlayer, new Location(world, clickedPos.getX(), clickedPos.getY(), clickedPos.getZ()))) {
                     return;
                 }
 
-                ItemStack inHand = player.getItemInHand(hand);
-
+                ItemStack inHand = player.getItemInHand(parsed.hand);
                 BlockItem.updateCustomBlockEntityTag(player.level(), player, clickedPos, inHand);
 
                 BlockEntity blockEntity = player.level().getBlockEntity(clickedPos);
@@ -256,14 +445,12 @@ public class SetBlockPacketListener implements PacketHandler {
 
         BlockFace blockFace = CraftBlock.notchToBlockFace(blockHit.getDirection());
 
-        // Call interact event
         PlayerInteractEvent playerInteractEvent = new PlayerInteractEvent(bukkitPlayer,
             breaking ? Action.LEFT_CLICK_BLOCK : Action.RIGHT_CLICK_BLOCK, heldItem, blockClicked, blockFace);
         if (!playerInteractEvent.callEvent()) {
             return false;
         }
 
-        // Call BlockMultiPlace / BlockPlace event
         if (!breaking) {
             List<org.bukkit.block.BlockState> blockStates = new ArrayList<>();
             for (Map.Entry<BlockPos, BlockState> entry : blocks.entrySet()) {
@@ -342,18 +529,14 @@ public class SetBlockPacketListener implements PacketHandler {
                 BlockEntity blockEntity = chunk.getBlockEntity(blockPos, LevelChunk.EntityCreationType.CHECK);
 
                 if (blockEntity == null) {
-                    // There isn't a block entity here, create it!
                     blockEntity = ((EntityBlock)block).newBlockEntity(blockPos, blockState);
                     if (blockEntity != null) {
                         chunk.addAndRegisterBlockEntity(blockEntity);
                     }
                 } else if (blockEntity.getType().isValid(blockState)) {
-                    // Block entity is here and the type is correct
-                    // Just update the state and ticker and move on
                     blockEntity.setBlockState(blockState);
                     AxiomReflection.updateBlockEntityTicker(chunk, blockEntity);
                 } else {
-                    // Block entity type isn't correct, we need to recreate it
                     chunk.removeBlockEntity(blockPos);
 
                     blockEntity = ((EntityBlock)block).newBlockEntity(blockPos, blockState);
@@ -365,18 +548,12 @@ public class SetBlockPacketListener implements PacketHandler {
                 chunk.removeBlockEntity(blockPos);
             }
 
-            // Mark block changed
             level.getChunkSource().blockChanged(blockPos);
 
-            // Update Light
             if (LightEngine.hasDifferentLightProperties(old, blockState)) {
-                // Note: Skylight Sources not currently needed on Paper due to Starlight
-                // This might change in the future, so be careful!
-                // chunk.getSkyLightSources().update(chunk, x, by, z);
                 level.getChunkSource().getLightEngine().checkBlock(blockPos);
             }
 
-            // Update Poi
             Optional<Holder<PoiType>> newPoi = PoiTypes.forState(blockState);
             Optional<Holder<PoiType>> oldPoi = PoiTypes.forState(old);
             if (!Objects.equals(oldPoi, newPoi)) {

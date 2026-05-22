@@ -16,3 +16,6 @@ First, the player must be an op on the server. If the player does not have op pe
 If you're using an alternative solution for permission management, you must give players the `axiom.default` permission.
 
 If players continue to have issues, they can run the `/whynoaxiom` command for more information.
+## Folia support
+
+This project now includes support for Folia (an asynchronous server framework). Folia is supported alongside Paper; consult the docs or issues for compatibility notes and usage details.

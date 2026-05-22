@@ -3,32 +3,22 @@ package com.moulberry.axiom.packet.impl;
 import com.moulberry.axiom.AxiomPaper;
 import com.moulberry.axiom.buffer.BiomeBuffer;
 import com.moulberry.axiom.buffer.BlockBuffer;
-import com.moulberry.axiom.integration.Integration;
+import com.moulberry.axiom.operations.SetBiomeBufferOperation;
 import com.moulberry.axiom.operations.SetBlockBufferOperation;
 import com.moulberry.axiom.packet.PacketHandler;
 import com.moulberry.axiom.restrictions.AxiomPermission;
-import net.minecraft.core.Holder;
-import net.minecraft.core.Registry;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.RegistryFriendlyByteBuf;
-import net.minecraft.network.protocol.game.ClientboundChunksBiomesPacket;
 import net.minecraft.resources.ResourceKey;
-import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
-import net.minecraft.world.level.biome.Biome;
-import net.minecraft.world.level.chunk.LevelChunk;
-import net.minecraft.world.level.chunk.PalettedContainer;
-import net.minecraft.world.level.chunk.status.ChunkStatus;
-import org.bukkit.Location;
 import org.bukkit.craftbukkit.entity.CraftPlayer;
 import org.bukkit.entity.Player;
 
-import java.util.*;
+import java.util.UUID;
 
-public class SetBlockBufferPacketListener implements PacketHandler {
+public class SetBlockBufferPacketListener implements PacketHandler<SetBlockBufferPacketListener.ParsedBuffer> {
 
     private final AxiomPaper plugin;
 
@@ -41,128 +31,106 @@ public class SetBlockBufferPacketListener implements PacketHandler {
         return true;
     }
 
-    public void onReceive(Player player, RegistryFriendlyByteBuf friendlyByteBuf) {
-        ServerPlayer serverPlayer = ((CraftPlayer)player).getHandle();
-        MinecraftServer server = serverPlayer.level().getServer();
-        if (server == null) return;
+    public static class ParsedBuffer {
+        public final ResourceKey<Level> worldKey;
+        public final byte type;
+        public final BlockBuffer blockBuffer;
+        public final BiomeBuffer biomeBuffer;
+        public final int clientAvailableDispatchSends;
 
+        public ParsedBuffer(ResourceKey<Level> worldKey, byte type, BlockBuffer blockBuffer, BiomeBuffer biomeBuffer, int clientAvailableDispatchSends) {
+            this.worldKey = worldKey;
+            this.type = type;
+            this.blockBuffer = blockBuffer;
+            this.biomeBuffer = biomeBuffer;
+            this.clientAvailableDispatchSends = clientAvailableDispatchSends;
+        }
+    }
+
+    @Override
+    public boolean precheck(Player player, AxiomPaper plugin, RegistryFriendlyByteBuf friendlyByteBuf) {
+        if (!plugin.canUseAxiom(player, AxiomPermission.BUILD_SECTION)) {
+            return false;
+        }
+
+        int readerIndex = friendlyByteBuf.readerIndex();
+        try {
+            ResourceKey<Level> worldKey = friendlyByteBuf.readResourceKey(Registries.DIMENSION);
+            ServerPlayer serverPlayer = ((CraftPlayer)player).getHandle();
+            ServerLevel world = serverPlayer.level();
+            if (!world.dimension().equals(worldKey) || !plugin.canModifyWorld(player, world.getWorld())) {
+                return false;
+            }
+            return true;
+        } catch (Throwable t) {
+            return false;
+        } finally {
+            friendlyByteBuf.readerIndex(readerIndex);
+        }
+    }
+
+    @Override
+    public ParsedBuffer parse(UUID playerUuid, int protocolVersion, RegistryFriendlyByteBuf friendlyByteBuf) {
         ResourceKey<Level> worldKey = friendlyByteBuf.readResourceKey(Registries.DIMENSION);
         friendlyByteBuf.readUUID(); // Discard, we don't need to associate buffers
 
         byte type = friendlyByteBuf.readByte();
+        BlockBuffer blockBuffer = null;
+        BiomeBuffer biomeBuffer = null;
         if (type == 0) {
-            BlockBuffer buffer = BlockBuffer.load(friendlyByteBuf, this.plugin.getBlockRegistry(serverPlayer.getUUID()), serverPlayer.getBukkitEntity());
-            int clientAvailableDispatchSends = friendlyByteBuf.readVarInt();
-
-            applyBlockBuffer(serverPlayer, server, buffer, worldKey, clientAvailableDispatchSends);
+            blockBuffer = BlockBuffer.load(friendlyByteBuf, this.plugin.getBlockRegistry(playerUuid), protocolVersion);
         } else if (type == 1) {
-            BiomeBuffer buffer = BiomeBuffer.load(friendlyByteBuf);
-            int clientAvailableDispatchSends = friendlyByteBuf.readVarInt();
-
-            applyBiomeBuffer(serverPlayer, server, buffer, worldKey, clientAvailableDispatchSends);
+            biomeBuffer = BiomeBuffer.load(friendlyByteBuf);
         } else {
             throw new RuntimeException("Unknown buffer type: " + type);
         }
+        int clientAvailableDispatchSends = friendlyByteBuf.readVarInt();
+        return new ParsedBuffer(worldKey, type, blockBuffer, biomeBuffer, clientAvailableDispatchSends);
     }
 
-    private void applyBlockBuffer(ServerPlayer player, MinecraftServer server, BlockBuffer buffer, ResourceKey<Level> worldKey, int clientAvailableDispatchSends) {
-        server.execute(() -> {
+    @Override
+    public void apply(Player player, ParsedBuffer parsed) {
+        ServerPlayer serverPlayer = ((CraftPlayer)player).getHandle();
+        ServerLevel world = serverPlayer.level();
+
+        // Guard: player may have changed worlds between precheck and apply
+        if (!world.dimension().equals(parsed.worldKey)) {
+            return;
+        }
+
+        if (parsed.type == 0) {
             try {
                 if (this.plugin.logLargeBlockBufferChanges()) {
-                    this.plugin.getLogger().info("Player " + player.getUUID() + " modified " + buffer.getSectionCount() + " chunk sections (blocks)");
-                    if (buffer.getTotalBlockEntities() > 0) {
-                        this.plugin.getLogger().info("Player " + player.getUUID() + " modified " + buffer.getTotalBlockEntities() + " block entities, compressed bytes = " +
-                            buffer.getTotalBlockEntityBytes());
+                    this.plugin.getLogger().info("Player " + player.getUniqueId() + " modified " + parsed.blockBuffer.getSectionCount() + " chunk sections (blocks)");
+                    if (parsed.blockBuffer.getTotalBlockEntities() > 0) {
+                        this.plugin.getLogger().info("Player " + player.getUniqueId() + " modified " + parsed.blockBuffer.getTotalBlockEntities() + " block entities, compressed bytes = " +
+                            parsed.blockBuffer.getTotalBlockEntityBytes());
                     }
                 }
 
-                if (!this.plugin.consumeDispatchSends(player.getBukkitEntity(), buffer.getSectionCount(), clientAvailableDispatchSends)) {
+                if (!this.plugin.consumeDispatchSends(player, parsed.blockBuffer.getSectionCount(), parsed.clientAvailableDispatchSends)) {
                     return;
                 }
 
-                if (!this.plugin.canUseAxiom(player.getBukkitEntity(), AxiomPermission.BUILD_SECTION)) {
-                    return;
-                }
-
-                ServerLevel world = player.level();
-                if (!world.dimension().equals(worldKey) || !this.plugin.canModifyWorld(player.getBukkitEntity(), world.getWorld())) {
-                    return;
-                }
-
-                boolean allowNbt = this.plugin.hasPermission(player.getBukkitEntity(), AxiomPermission.BUILD_NBT);
-                this.plugin.addPendingOperation(world, new SetBlockBufferOperation(player, buffer, allowNbt));
+                boolean allowNbt = this.plugin.hasPermission(player, AxiomPermission.BUILD_NBT);
+                this.plugin.addPendingOperation(world, new SetBlockBufferOperation(serverPlayer, parsed.blockBuffer, allowNbt));
             } catch (Throwable t) {
-                player.getBukkitEntity().kick(net.kyori.adventure.text.Component.text("An error occured while processing block change: " + t.getMessage()));
+                player.kick(net.kyori.adventure.text.Component.text("An error occured while processing block change: " + t.getMessage()));
             }
-        });
-    }
-
-    private void applyBiomeBuffer(ServerPlayer player, MinecraftServer server, BiomeBuffer biomeBuffer, ResourceKey<Level> worldKey, int clientAvailableDispatchSends) {
-        server.execute(() -> {
+        } else if (parsed.type == 1) {
             try {
                 if (this.plugin.logLargeBlockBufferChanges()) {
-                    this.plugin.getLogger().info("Player " + player.getUUID() + " modified " + biomeBuffer.getSectionCount() + " chunk sections (biomes)");
+                    this.plugin.getLogger().info("Player " + player.getUniqueId() + " modified " + parsed.biomeBuffer.getSectionCount() + " chunk sections (biomes)");
                 }
 
-                if (!this.plugin.consumeDispatchSends(player.getBukkitEntity(), biomeBuffer.getSectionCount(), clientAvailableDispatchSends)) {
+                if (!this.plugin.consumeDispatchSends(player, parsed.biomeBuffer.getSectionCount(), parsed.clientAvailableDispatchSends)) {
                     return;
                 }
 
-                if (!this.plugin.canUseAxiom(player.getBukkitEntity(), AxiomPermission.BUILD_SECTION)) {
-                    return;
-                }
-
-                ServerLevel world = player.level();
-                if (!world.dimension().equals(worldKey) || !this.plugin.canModifyWorld(player.getBukkitEntity(), world.getWorld())) {
-                    return;
-                }
-
-                Set<LevelChunk> changedChunks = new HashSet<>();
-
-                int minSection = world.getMinSectionY();
-                int maxSection = world.getMaxSectionY();
-
-                Optional<Registry<Biome>> registryOptional = world.registryAccess().lookup(Registries.BIOME);
-                if (registryOptional.isEmpty()) return;
-
-                Registry<Biome> registry = registryOptional.get();
-
-                biomeBuffer.forEachEntry((x, y, z, biome) -> {
-                    int cy = y >> 2;
-                    if (cy < minSection || cy > maxSection) {
-                        return;
-                    }
-
-                    var holder = registry.get(biome);
-                    if (holder.isPresent()) {
-                        LevelChunk chunk = (LevelChunk) world.getChunk(x >> 2, z >> 2, ChunkStatus.FULL, false);
-                        if (chunk == null) return;
-
-                        var section = chunk.getSection(cy - minSection);
-                        PalettedContainer<Holder<Biome>> container = (PalettedContainer<Holder<Biome>>) section.getBiomes();
-
-                        if (!Integration.canPlaceBlock(player.getBukkitEntity(),
-                            new Location(player.getBukkitEntity().getWorld(), (x<<2)+1, (y<<2)+1, (z<<2)+1))) return;
-
-                        container.set(x & 3, y & 3, z & 3, holder.get());
-                        changedChunks.add(chunk);
-                    }
-                });
-
-                var chunkMap = world.getChunkSource().chunkMap;
-                HashMap<ServerPlayer, List<LevelChunk>> map = new HashMap<>();
-                for (LevelChunk chunk : changedChunks) {
-                    chunk.markUnsaved();
-                    ChunkPos chunkPos = chunk.getPos();
-                    for (ServerPlayer serverPlayer2 : chunkMap.getPlayers(chunkPos, false)) {
-                        map.computeIfAbsent(serverPlayer2, serverPlayer -> new ArrayList<>()).add(chunk);
-                    }
-                }
-                map.forEach((serverPlayer, list) -> serverPlayer.connection.send(ClientboundChunksBiomesPacket.forChunks(list)));
+                this.plugin.addPendingOperation(world, new SetBiomeBufferOperation(serverPlayer, parsed.biomeBuffer));
             } catch (Throwable t) {
-                player.getBukkitEntity().kick(net.kyori.adventure.text.Component.text("An error occured while processing biome change: " + t.getMessage()));
+                player.kick(net.kyori.adventure.text.Component.text("An error occured while processing biome change: " + t.getMessage()));
             }
-        });
+        }
     }
-
 }

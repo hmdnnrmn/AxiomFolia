@@ -29,7 +29,7 @@ import java.util.*;
 
 public class WorldExtension {
 
-    private static final Map<ResourceKey<Level>, WorldExtension> extensions = new HashMap<>();
+    private static final Map<ResourceKey<Level>, WorldExtension> extensions = new java.util.concurrent.ConcurrentHashMap<>();
 
     public static WorldExtension get(ServerLevel serverLevel) {
         WorldExtension extension = extensions.computeIfAbsent(serverLevel.dimension(), k -> new WorldExtension());
@@ -58,14 +58,47 @@ public class WorldExtension {
 
     private final LongSet pendingChunksToSend = new LongOpenHashSet();
     private final LongSet pendingChunksToLight = new LongOpenHashSet();
-    private final Map<UUID, MarkerData> previousMarkerData = new HashMap<>();
+    private final Map<UUID, MarkerData> previousMarkerData = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Set<UUID> activeMarkerUuids = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    public void addMarker(UUID uuid) {
+        this.activeMarkerUuids.add(uuid);
+    }
+
+    public void removeMarker(UUID uuid) {
+        if (this.activeMarkerUuids.remove(uuid) || this.previousMarkerData.containsKey(uuid)) {
+            this.previousMarkerData.remove(uuid);
+            if (VersionHelper.isFolia()) {
+                this.sendMarkerRemoval(uuid);
+            }
+        }
+    }
 
     public void sendChunk(int cx, int cz) {
-        this.pendingChunksToSend.add(ChunkPos.pack(cx, cz));
+        if (VersionHelper.isFolia()) {
+            LevelChunk chunk = this.level.getChunkIfLoaded(cx, cz);
+            if (chunk != null) {
+                net.minecraft.server.level.ChunkMap chunkMap = this.level.getChunkSource().chunkMap;
+                List<ServerPlayer> players = chunkMap.getPlayers(new ChunkPos(cx, cz), false);
+                if (!players.isEmpty()) {
+                    var packet = new net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket(chunk, this.level.getLightEngine(), null, null, false);
+                    for (ServerPlayer player : players) {
+                        player.connection.send(packet);
+                    }
+                }
+            }
+        } else {
+            this.pendingChunksToSend.add(ChunkPos.pack(cx, cz));
+        }
     }
 
     public void lightChunk(int cx, int cz) {
-        this.pendingChunksToLight.add(ChunkPos.pack(cx, cz));
+        if (VersionHelper.isFolia()) {
+            Set<ChunkPos> chunkSet = Collections.singleton(new ChunkPos(cx, cz));
+            this.level.getChunkSource().getLightEngine().starlight$serverRelightChunks(chunkSet, pos -> {}, count -> {});
+        } else {
+            this.pendingChunksToLight.add(ChunkPos.pack(cx, cz));
+        }
     }
 
     public void onPlayerJoin(Player player) {
@@ -96,7 +129,74 @@ public class WorldExtension {
         this.tickChunkRelight(maxChunkRelightsPerTick, maxChunkSendsPerTick);
     }
 
+    private void sendMarkerUpdate(MarkerData data) {
+        FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+        buf.writeCollection(List.of(data), MarkerData::write);
+        buf.writeCollection(Set.<UUID>of(), (buffer, uuid) -> buffer.writeUUID(uuid));
+        byte[] bytes = ByteBufUtil.getBytes(buf);
+
+        List<ServerPlayer> players = new ArrayList<>();
+        for (ServerPlayer player : this.level.players()) {
+            if (AxiomPaper.PLUGIN.canUseAxiom(player.getBukkitEntity())) {
+                players.add(player);
+            }
+        }
+        VersionHelper.sendCustomPayloadToAll(players, "axiom:marker_data", bytes);
+    }
+
+    private void sendMarkerRemoval(UUID uuid) {
+        FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+        buf.writeCollection(List.<MarkerData>of(), MarkerData::write);
+        buf.writeCollection(List.of(uuid), (buffer, u) -> buffer.writeUUID(u));
+        byte[] bytes = ByteBufUtil.getBytes(buf);
+
+        List<ServerPlayer> players = new ArrayList<>();
+        for (ServerPlayer player : this.level.players()) {
+            if (AxiomPaper.PLUGIN.canUseAxiom(player.getBukkitEntity())) {
+                players.add(player);
+            }
+        }
+        VersionHelper.sendCustomPayloadToAll(players, "axiom:marker_data", bytes);
+    }
+
     private void tickMarkers() {
+        if (VersionHelper.isFolia()) {
+            for (UUID uuid : this.activeMarkerUuids) {
+                org.bukkit.entity.Entity bukkitEntity = org.bukkit.Bukkit.getEntity(uuid);
+                if (bukkitEntity == null || !bukkitEntity.isValid()) {
+                    this.activeMarkerUuids.remove(uuid);
+                    if (this.previousMarkerData.remove(uuid) != null) {
+                        this.sendMarkerRemoval(uuid);
+                    }
+                } else {
+                    bukkitEntity.getScheduler().run(AxiomPaper.PLUGIN, task -> {
+                        if (!bukkitEntity.isValid()) {
+                            this.activeMarkerUuids.remove(uuid);
+                            if (this.previousMarkerData.remove(uuid) != null) {
+                                this.sendMarkerRemoval(uuid);
+                            }
+                            return;
+                        }
+                        org.bukkit.entity.Marker marker = (org.bukkit.entity.Marker) bukkitEntity;
+                        if (ImplAxiomHiddenEntities.isMarkerHidden(marker)) {
+                            if (this.previousMarkerData.remove(uuid) != null) {
+                                this.sendMarkerRemoval(uuid);
+                            }
+                            return;
+                        }
+                        net.minecraft.world.entity.Marker nmsMarker = (net.minecraft.world.entity.Marker) ((org.bukkit.craftbukkit.entity.CraftMarker) marker).getHandle();
+                        MarkerData currentData = MarkerData.createFrom(nmsMarker);
+                        MarkerData previousData = this.previousMarkerData.get(uuid);
+                        if (!Objects.equals(currentData, previousData)) {
+                            this.previousMarkerData.put(uuid, currentData);
+                            this.sendMarkerUpdate(currentData);
+                        }
+                    }, null);
+                }
+            }
+            return;
+        }
+
         List<MarkerData> changedData = new ArrayList<>();
 
         Set<UUID> allMarkers = new HashSet<>();
@@ -142,6 +242,9 @@ public class WorldExtension {
     }
 
     private void tickChunkRelight(int maxChunkRelightsPerTick, int maxChunkSendsPerTick) {
+        if (VersionHelper.isFolia()) {
+            return;
+        }
         ChunkMap chunkMap = this.level.getChunkSource().chunkMap;
 
         boolean sendAll = maxChunkSendsPerTick <= 0;

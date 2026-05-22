@@ -53,6 +53,7 @@ public class RequestChunksOperation implements PendingOperation {
     private final long id;
 
     private final LongArrayList getChunkFutures;
+    private final LongSet loadedOnlyChunks;
     private  List<CompletableFuture<Chunk>> chunkFutures = new ArrayList<>();
     private final Long2ObjectMap<LongList> sendBlockEntityForPendingChunks;
     private final Long2ObjectMap<IntList> sendSectionsForPendingChunks;
@@ -62,9 +63,10 @@ public class RequestChunksOperation implements PendingOperation {
     private final Long2ObjectOpenHashMap<CompressedBlockEntity> sendingBlockEntities;
     private final ByteArrayOutputStream baos;
 
-    public RequestChunksOperation(ServerPlayer serverPlayer, long id, LongSet chunkFutures, Long2ObjectMap<LongList> sendBlockEntityForPendingChunks, Long2ObjectMap<IntList> sendSectionsForPendingChunks, boolean sendBlockEntitiesInChunks, Long2ObjectOpenHashMap<PalettedContainer<BlockState>> sendingSections, Long2ObjectOpenHashMap<CompressedBlockEntity> sendingBlockEntities, ByteArrayOutputStream baos) {
+    public RequestChunksOperation(ServerLevel level, ServerPlayer serverPlayer, long id, LongSet chunkFutures, LongSet loadedOnlyChunks, Long2ObjectMap<LongList> sendBlockEntityForPendingChunks, Long2ObjectMap<IntList> sendSectionsForPendingChunks, boolean sendBlockEntitiesInChunks, Long2ObjectOpenHashMap<PalettedContainer<BlockState>> sendingSections, Long2ObjectOpenHashMap<CompressedBlockEntity> sendingBlockEntities, ByteArrayOutputStream baos) {
         this.serverPlayer = serverPlayer;
         this.id = id;
+        this.loadedOnlyChunks = loadedOnlyChunks;
         this.sendBlockEntityForPendingChunks = sendBlockEntityForPendingChunks;
         this.sendSectionsForPendingChunks = sendSectionsForPendingChunks;
         this.sendBlockEntitiesInChunks = sendBlockEntitiesInChunks;
@@ -75,6 +77,17 @@ public class RequestChunksOperation implements PendingOperation {
         LongArrayList getChunkFutures = new LongArrayList(chunkFutures);
         getChunkFutures.unstableSort(LongComparators.NATURAL_COMPARATOR);
         this.getChunkFutures = getChunkFutures;
+
+        if (!VersionHelper.isFolia()) {
+            for (long pos : loadedOnlyChunks) {
+                int cx = ChunkPos.getX(pos);
+                int cz = ChunkPos.getZ(pos);
+                LevelChunk chunk = level.getChunkIfLoaded(cx, cz);
+                if (chunk != null) {
+                    processChunk(chunk);
+                }
+            }
+        }
     }
 
     @Override
@@ -85,6 +98,105 @@ public class RequestChunksOperation implements PendingOperation {
     @Override
     public ServerPlayer executor() {
         return this.serverPlayer;
+    }
+
+    @Override
+    public void startFolia(ServerLevel level, Runnable onComplete) {
+        if (this.finished) {
+            onComplete.run();
+            return;
+        }
+
+        if (this.serverPlayer.hasDisconnected()) {
+            this.finished = true;
+            onComplete.run();
+            return;
+        }
+
+        if (this.getChunkFutures.isEmpty() && this.loadedOnlyChunks.isEmpty()) {
+            RequestChunkDataPacketListener.sendResponse(this.serverPlayer, this.id, this.sendingBlockEntities, this.sendingSections);
+            this.finished = true;
+            onComplete.run();
+            return;
+        }
+
+        java.util.concurrent.atomic.AtomicInteger remaining = new java.util.concurrent.atomic.AtomicInteger(this.getChunkFutures.size() + this.loadedOnlyChunks.size());
+
+        // Process load-allowed chunks
+        LongIterator iterator = this.getChunkFutures.longIterator();
+        while (iterator.hasNext()) {
+            long chunkPos = iterator.nextLong();
+            int x = ChunkPos.getX(chunkPos);
+            int z = ChunkPos.getZ(chunkPos);
+
+            level.getWorld().getChunkAtAsync(x, z).thenAccept(bukkitChunk -> {
+                if (this.serverPlayer.hasDisconnected()) {
+                    this.finished = true;
+                    if (remaining.decrementAndGet() == 0) {
+                        onComplete.run();
+                    }
+                    return;
+                }
+
+                int cx = bukkitChunk.getX();
+                int cz = bukkitChunk.getZ();
+                org.bukkit.Bukkit.getRegionScheduler().run(com.moulberry.axiom.AxiomPaper.PLUGIN, level.getWorld(), cx, cz, task -> {
+                    try {
+                        if (this.serverPlayer.hasDisconnected()) {
+                            this.finished = true;
+                            return;
+                        }
+
+                        LevelChunk chunk = (LevelChunk) ((org.bukkit.craftbukkit.CraftChunk) bukkitChunk).getHandle(ChunkStatus.FULL);
+                        processChunk(chunk);
+                    } finally {
+                        if (remaining.decrementAndGet() == 0) {
+                            if (!this.serverPlayer.hasDisconnected()) {
+                                RequestChunkDataPacketListener.sendResponse(this.serverPlayer, this.id, this.sendingBlockEntities, this.sendingSections);
+                            }
+                            this.finished = true;
+                            onComplete.run();
+                        }
+                    }
+                });
+            }).exceptionally(t -> {
+                if (remaining.decrementAndGet() == 0) {
+                    this.finished = true;
+                    onComplete.run();
+                }
+                return null;
+            });
+        }
+
+        // Process loaded-only chunks
+        LongIterator loadedOnlyIterator = this.loadedOnlyChunks.iterator();
+        while (loadedOnlyIterator.hasNext()) {
+            long chunkPos = loadedOnlyIterator.nextLong();
+            int x = ChunkPos.getX(chunkPos);
+            int z = ChunkPos.getZ(chunkPos);
+
+            org.bukkit.Bukkit.getRegionScheduler().run(com.moulberry.axiom.AxiomPaper.PLUGIN, level.getWorld(), x, z, task -> {
+                try {
+                    if (this.serverPlayer.hasDisconnected()) {
+                        this.finished = true;
+                        return;
+                    }
+
+                    LevelChunk chunk = level.getChunkIfLoaded(x, z);
+                    if (chunk != null) {
+                        processChunk(chunk);
+                    }
+                } finally {
+                    if (remaining.decrementAndGet() == 0) {
+                        if (!this.serverPlayer.hasDisconnected()) {
+                            RequestChunkDataPacketListener.sendResponse(this.serverPlayer, this.id, this.sendingBlockEntities, this.sendingSections);
+                        }
+                        this.finished = true;
+                        onComplete.run();
+                    }
+                }
+            });
+        }
     }
 
     @Override
@@ -111,9 +223,9 @@ public class RequestChunksOperation implements PendingOperation {
             }
         }
 
-        Iterator<CompletableFuture<Chunk>> chunkFutureIterator = this.chunkFutures.iterator();
+        Iterator<CompletableFuture<org.bukkit.Chunk>> chunkFutureIterator = this.chunkFutures.iterator();
         while (chunkFutureIterator.hasNext()) {
-            CompletableFuture<Chunk> future = chunkFutureIterator.next();
+            CompletableFuture<org.bukkit.Chunk> future = chunkFutureIterator.next();
             if (!future.isDone()) {
                 return;
             }
@@ -121,66 +233,7 @@ public class RequestChunksOperation implements PendingOperation {
             chunkFutureIterator.remove();
 
             LevelChunk chunk = (LevelChunk) ((CraftChunk)future.join()).getHandle(ChunkStatus.FULL);
-            long chunkPosLong = ChunkPos.pack(chunk.locX, chunk.locZ);
-            LongList blockEntitiesInChunk = this.sendBlockEntityForPendingChunks.get(chunkPosLong);
-            if (blockEntitiesInChunk != null) {
-                LongIterator iterator = blockEntitiesInChunk.longIterator();
-                while (iterator.hasNext()) {
-                    long blockEntityPos = iterator.nextLong();
-                    this.mutableBlockPos.set(blockEntityPos);
-
-                    BlockEntity blockEntity = chunk.getBlockEntity(this.mutableBlockPos, LevelChunk.EntityCreationType.CHECK);
-                    if (blockEntity != null) {
-                        CompoundTag tag = blockEntity.saveWithoutMetadata(this.serverPlayer.registryAccess());
-                        this.sendingBlockEntities.put(blockEntityPos, CompressedBlockEntity.compress(tag, baos));
-                    }
-                }
-            }
-
-            IntList sendSectionsInChunk = this.sendSectionsForPendingChunks.get(chunkPosLong);
-            if (sendSectionsInChunk != null) {
-                boolean hasNonAirSectionInChunk = false;
-
-                IntIterator sectionIterator = sendSectionsInChunk.intIterator();
-                while (sectionIterator.hasNext()) {
-                    int sy = sectionIterator.nextInt();
-
-                    int sectionIndex = chunk.getSectionIndexFromSectionY(sy);
-                    if (sectionIndex < 0 || sectionIndex >= chunk.getSectionsCount()) continue;
-                    LevelChunkSection section = chunk.getSection(sectionIndex);
-
-                    if (section.hasOnlyAir()) {
-                        this.sendingSections.put(BlockPos.asLong(chunk.locX, sy, chunk.locZ), null);
-                    } else {
-                        PalettedContainer<BlockState> container = section.getStates();
-                        this.sendingSections.put(BlockPos.asLong(chunk.locX, sy, chunk.locZ), container);
-                        hasNonAirSectionInChunk = true;
-                    }
-                }
-
-                if (this.sendBlockEntitiesInChunks && hasNonAirSectionInChunk) {
-                    Set<Map.Entry<BlockPos, BlockEntity>> entrySet = chunk.blockEntities.entrySet();
-                    Iterator<Map.Entry<BlockPos, BlockEntity>> iterator;
-                    if (entrySet instanceof Object2ObjectMap.FastEntrySet fastEntrySet) {
-                        iterator = fastEntrySet.fastIterator();
-                    } else {
-                        iterator = entrySet.iterator();
-                    }
-
-                    while (iterator.hasNext()) {
-                        Map.Entry<BlockPos, BlockEntity> entry = iterator.next();
-
-                        BlockPos blockPos = entry.getKey();
-                        int sectionY = blockPos.getY() >> 4;
-                        if (!sendSectionsInChunk.contains(sectionY)) {
-                            continue;
-                        }
-
-                        CompoundTag tag = entry.getValue().saveWithoutMetadata(this.serverPlayer.registryAccess());
-                        this.sendingBlockEntities.put(blockPos.asLong(), CompressedBlockEntity.compress(tag, baos));
-                    }
-                }
-            }
+            processChunk(chunk);
         }
 
         if (!this.getChunkFutures.isEmpty()) {
@@ -191,5 +244,77 @@ public class RequestChunksOperation implements PendingOperation {
         this.finished = true;
     }
 
+    private void processChunk(LevelChunk chunk) {
+        long chunkPosLong = ChunkPos.pack(chunk.locX, chunk.locZ);
+        int cx = chunk.locX;
+        int cz = chunk.locZ;
 
+        LongList blockEntitiesInChunk = this.sendBlockEntityForPendingChunks.get(chunkPosLong);
+        if (blockEntitiesInChunk != null) {
+            LongIterator blockEntityIterator = blockEntitiesInChunk.longIterator();
+            while (blockEntityIterator.hasNext()) {
+                long blockEntityPos = blockEntityIterator.nextLong();
+                BlockPos blockEntityPosMutable = new BlockPos(BlockPos.getX(blockEntityPos), BlockPos.getY(blockEntityPos), BlockPos.getZ(blockEntityPos));
+
+                BlockEntity blockEntity = chunk.getBlockEntity(blockEntityPosMutable, LevelChunk.EntityCreationType.CHECK);
+                if (blockEntity != null) {
+                    CompoundTag tag = blockEntity.saveWithoutMetadata(this.serverPlayer.registryAccess());
+                    synchronized (this) {
+                        this.sendingBlockEntities.put(blockEntityPos, com.moulberry.axiom.buffer.CompressedBlockEntity.compress(tag, this.baos));
+                    }
+                }
+            }
+        }
+
+        IntList sendSectionsInChunk = this.sendSectionsForPendingChunks.get(chunkPosLong);
+        if (sendSectionsInChunk != null) {
+            boolean hasNonAirSectionInChunk = false;
+
+            IntIterator sectionIterator = sendSectionsInChunk.intIterator();
+            while (sectionIterator.hasNext()) {
+                int sy = sectionIterator.nextInt();
+
+                int sectionIndex = chunk.getSectionIndexFromSectionY(sy);
+                if (sectionIndex < 0 || sectionIndex >= chunk.getSectionsCount()) continue;
+                LevelChunkSection section = chunk.getSection(sectionIndex);
+
+                if (section.hasOnlyAir()) {
+                    synchronized (this) {
+                        this.sendingSections.put(BlockPos.asLong(cx, sy, cz), null);
+                    }
+                } else {
+                    PalettedContainer<BlockState> container = section.getStates().copy();
+                    synchronized (this) {
+                        this.sendingSections.put(BlockPos.asLong(cx, sy, cz), container);
+                    }
+                    hasNonAirSectionInChunk = true;
+                }
+            }
+
+            if (this.sendBlockEntitiesInChunks && hasNonAirSectionInChunk) {
+                Set<Map.Entry<BlockPos, BlockEntity>> entrySet = chunk.blockEntities.entrySet();
+                Iterator<Map.Entry<BlockPos, BlockEntity>> entryIterator;
+                if (entrySet instanceof Object2ObjectMap.FastEntrySet fastEntrySet) {
+                    entryIterator = fastEntrySet.fastIterator();
+                } else {
+                    entryIterator = entrySet.iterator();
+                }
+
+                while (entryIterator.hasNext()) {
+                    Map.Entry<BlockPos, BlockEntity> entry = entryIterator.next();
+
+                    BlockPos blockPos = entry.getKey();
+                    int sectionY = blockPos.getY() >> 4;
+                    if (!sendSectionsInChunk.contains(sectionY)) {
+                        continue;
+                    }
+
+                    CompoundTag tag = entry.getValue().saveWithoutMetadata(this.serverPlayer.registryAccess());
+                    synchronized (this) {
+                        this.sendingBlockEntities.put(blockPos.asLong(), com.moulberry.axiom.buffer.CompressedBlockEntity.compress(tag, this.baos));
+                    }
+                }
+            }
+        }
+    }
 }
