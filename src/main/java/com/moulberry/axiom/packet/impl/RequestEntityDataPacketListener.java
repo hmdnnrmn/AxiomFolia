@@ -111,13 +111,13 @@ public class RequestEntityDataPacketListener implements PacketHandler<RequestEnt
                     int size = entityTag.sizeInBytes();
 
                     if (size >= maxPacketSize) {
-                        sendResponse(player, parsed.id(), false, Map.of(uuid, entityTag));
+                        scheduleSendResponse(player, parsed.id(), false, Map.of(uuid, entityTag));
                         continue;
                     }
 
                     if (remainingBytes - size < 0) {
-                        sendResponse(player, parsed.id(), false, entityData);
-                        entityData.clear();
+                        scheduleSendResponse(player, parsed.id(), false, entityData);
+                        entityData = new HashMap<>();
                         remainingBytes = maxPacketSize;
                     }
 
@@ -126,7 +126,7 @@ public class RequestEntityDataPacketListener implements PacketHandler<RequestEnt
                 }
             }
 
-            sendResponse(player, parsed.id(), true, entityData);
+            scheduleSendResponse(player, parsed.id(), true, entityData);
         }, this.plugin.getAsyncExecutor());
     }
 
@@ -152,6 +152,15 @@ public class RequestEntityDataPacketListener implements PacketHandler<RequestEnt
             return Map.entry(uuid, entityTag);
         }
         return null;
+    }
+
+    private static void scheduleSendResponse(ServerPlayer player, long id, boolean finished, Map<UUID, CompoundTag> map) {
+        Map<UUID, CompoundTag> payload = new HashMap<>(map);
+        if (VersionHelper.isFolia()) {
+            player.getBukkitEntity().getScheduler().run(AxiomPaper.PLUGIN, task -> sendResponse(player, id, finished, payload), null);
+        } else {
+            sendResponse(player, id, finished, payload);
+        }
     }
 
     private static void sendResponse(ServerPlayer player, long id, boolean finished, Map<UUID, CompoundTag> map) {

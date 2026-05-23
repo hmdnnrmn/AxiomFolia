@@ -49,18 +49,21 @@ public class OperationQueue {
                 }
 
                 ServerPlayer executor = operation.executor();
+                AtomicBoolean completed = new AtomicBoolean(false);
+                Runnable complete = () -> {
+                    if (completed.compareAndSet(false, true)) {
+                        running.set(false);
+                        processNext();
+                    }
+                };
                 Runnable startTask = () -> {
                     try {
-                        operation.startFolia(level, () -> {
-                            running.set(false);
-                            processNext();
-                        });
+                        operation.startFolia(level, complete);
                     } catch (Throwable t) {
                         if (executor != null && !executor.hasDisconnected()) {
                             executor.getBukkitEntity().kick(net.kyori.adventure.text.Component.text("An error occurred while processing operation: " + t.getMessage()));
                         }
-                        running.set(false);
-                        processNext();
+                        complete.run();
                     }
                 };
 

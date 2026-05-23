@@ -161,7 +161,8 @@ public class WorldExtension {
 
     private void tickMarkers() {
         if (VersionHelper.isFolia()) {
-            for (UUID uuid : this.activeMarkerUuids) {
+            List<UUID> markerUuids = new ArrayList<>(this.activeMarkerUuids);
+            for (UUID uuid : markerUuids) {
                 org.bukkit.entity.Entity bukkitEntity = org.bukkit.Bukkit.getEntity(uuid);
                 if (bukkitEntity == null || !bukkitEntity.isValid()) {
                     this.activeMarkerUuids.remove(uuid);
@@ -177,6 +178,10 @@ public class WorldExtension {
                             }
                             return;
                         }
+                        if (!this.activeMarkerUuids.contains(uuid)) {
+                            this.previousMarkerData.remove(uuid);
+                            return;
+                        }
                         org.bukkit.entity.Marker marker = (org.bukkit.entity.Marker) bukkitEntity;
                         if (ImplAxiomHiddenEntities.isMarkerHidden(marker)) {
                             if (this.previousMarkerData.remove(uuid) != null) {
@@ -186,11 +191,13 @@ public class WorldExtension {
                         }
                         net.minecraft.world.entity.Marker nmsMarker = (net.minecraft.world.entity.Marker) ((org.bukkit.craftbukkit.entity.CraftMarker) marker).getHandle();
                         MarkerData currentData = MarkerData.createFrom(nmsMarker);
-                        MarkerData previousData = this.previousMarkerData.get(uuid);
-                        if (!Objects.equals(currentData, previousData)) {
-                            this.previousMarkerData.put(uuid, currentData);
-                            this.sendMarkerUpdate(currentData);
-                        }
+                        this.previousMarkerData.compute(uuid, (k, previousData) -> {
+                            if (!Objects.equals(currentData, previousData)) {
+                                this.sendMarkerUpdate(currentData);
+                                return currentData;
+                            }
+                            return previousData;
+                        });
                     }, null);
                 }
             }

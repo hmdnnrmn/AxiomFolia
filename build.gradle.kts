@@ -38,7 +38,7 @@ repositories {
 }
 
 dependencies {
-    paperweight.foliaDevBundle("26.1.2.build.+")
+    paperweight.foliaDevBundle("26.1.2.build.8-stable")
 
     // Zstd Compression Library
     implementation(libs.zstd.jni)

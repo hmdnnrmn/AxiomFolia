@@ -145,7 +145,7 @@ public class SetBlockPacketListener implements PacketHandler<SetBlockPacketListe
             int clickedCz = clickedPos.getZ() >> 4;
 
             org.bukkit.Bukkit.getRegionScheduler().run(this.plugin, world, clickedCx, clickedCz, clickedTask -> {
-                if (player.hasDisconnected()) return;
+                if (!canMutateInRegion(bukkitPlayer, player, world)) return;
 
                 boolean eventsPassed = true;
                 if ((parsed.reason & REASON_REPLACEMODE) == 0 && (parsed.reason & REASON_ANGEL) == 0) {
@@ -173,7 +173,7 @@ public class SetBlockPacketListener implements PacketHandler<SetBlockPacketListe
                     java.util.Map<BlockPos, BlockState> chunkBlocks = chunkEntry.getValue();
 
                     org.bukkit.Bukkit.getRegionScheduler().run(this.plugin, world, chunkPos.x(), chunkPos.z(), chunkTask -> {
-                        if (player.hasDisconnected()) return;
+                        if (!canMutateInRegion(bukkitPlayer, player, world)) return;
 
                         if ((parsed.reason & REASON_REPLACEMODE) == 0 && (parsed.reason & REASON_ANGEL) == 0 && !parsed.breaking) {
                             List<org.bukkit.block.BlockState> blockStates = new ArrayList<>();
@@ -575,6 +575,13 @@ public class SetBlockPacketListener implements PacketHandler<SetBlockPacketListe
             level.getChunkSource().getLightEngine().updateSectionStatus(SectionPos.of(cx, cy, cz), nowHasOnlyAir);
             level.getChunkSource().onSectionEmptinessChanged(cx, cy, cz, nowHasOnlyAir);
         }
+    }
+
+    private boolean canMutateInRegion(Player bukkitPlayer, ServerPlayer player, CraftWorld world) {
+        return !player.hasDisconnected()
+            && bukkitPlayer.isOnline()
+            && bukkitPlayer.getWorld().equals(world)
+            && this.plugin.canUseAxiom(bukkitPlayer, AxiomPermission.BUILD_PLACE);
     }
 
     private static boolean canBreakOrPlace(Player bukkitPlayer, BlockState blockState, CraftWorld world, BlockPos blockPos) {
